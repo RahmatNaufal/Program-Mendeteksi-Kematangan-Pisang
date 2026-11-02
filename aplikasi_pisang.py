@@ -21,27 +21,39 @@ def deteksi_pisang(nama_file):
 
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-    # ---------------------------------------------------------
-    # PERBAIKAN SEGMENTASI OBJEK PISANG
-    # ---------------------------------------------------------
-    # 1. Segmentasi Warna Pisang (Hijau, Kuning, Cokelat/Oranye)
-    # Memperlebar rentang HSV agar mencakup area terang/bayangan
-    bawah_pisang = np.array([5, 20, 20])
-    atas_pisang = np.array([85, 255, 255])
-    
-    mask_pisang = cv2.inRange(hsv, bawah_pisang, atas_pisang)
 
-    # 2. Operasi Morfologi untuk Menyatukan Objek yang Terputus
-    kernel_besar = np.ones((15, 15), np.uint8)
-    kernel_kecil = np.ones((5, 5), np.uint8)
+    # SEGMENTASI OBJEK PISANG
+    # ==========================================
 
-    # Close: Menutup lubang-lubang kecil di dalam pisang
-    mask_pisang = cv2.morphologyEx(mask_pisang, cv2.MORPH_CLOSE, kernel_besar)
-    
-    # Dilate: Menyambung bagian kulit pisang yang renggang/terpisah
-    mask_pisang = cv2.dilate(mask_pisang, kernel_kecil, iterations=2)
+    # Memisahkan warna HSV
+    h, s, v = cv2.split(hsv)
 
-    # 3. Mencari Kontur Terbesar
+    # Mengambil objek pisang dan menghilangkan latar putih
+    bawah_pisang = np.array([0, 35, 30])
+    atas_pisang = np.array([90, 255, 255])
+
+    mask_pisang = cv2.inRange(
+        hsv, bawah_pisang, atas_pisang
+    )
+
+    # Menghilangkan noise kecil
+    kernel_kecil = np.ones((3, 3), np.uint8)
+    kernel_sedang = np.ones((7, 7), np.uint8)
+
+    mask_pisang = cv2.morphologyEx(
+        mask_pisang,
+        cv2.MORPH_OPEN,
+        kernel_kecil
+    )
+
+    # Menutup celah kecil pada objek
+    mask_pisang = cv2.morphologyEx(
+        mask_pisang,
+        cv2.MORPH_CLOSE,
+        kernel_sedang
+    )
+
+    # Mencari kontur objek
     kontur, _ = cv2.findContours(
         mask_pisang,
         cv2.RETR_EXTERNAL,
@@ -51,19 +63,21 @@ def deteksi_pisang(nama_file):
     if not kontur:
         raise ValueError("Objek pisang tidak ditemukan.")
 
-    mask_objek = np.zeros_like(mask_pisang)
+    # Mengambil kontur terbesar
+    kontur_terbesar = max(
+        kontur,
+        key=cv2.contourArea
+    )
 
-    # Memilih kontur dengan area terbesar (sisir pisang utama)
-    kontur_terbesar = max(kontur, key=cv2.contourArea)
-
-    # Memastikan kontur cukup besar (bukan noise)
     tinggi, lebar = mask_pisang.shape
     luas_gambar = tinggi * lebar
-    
-    if cv2.contourArea(kontur_terbesar) < (luas_gambar * 0.05):
+
+    if cv2.contourArea(kontur_terbesar) < luas_gambar * 0.05:
         raise ValueError("Objek pisang terlalu kecil atau tidak terdeteksi.")
 
-    # Menggambar kontur utama dan mengisi bagian dalamnya secara penuh
+    # Membuat mask khusus objek pisang
+    mask_objek = np.zeros_like(mask_pisang)
+
     cv2.drawContours(
         mask_objek,
         [kontur_terbesar],
@@ -72,9 +86,7 @@ def deteksi_pisang(nama_file):
         thickness=cv2.FILLED
     )
 
-    # Merapikan pinggiran mask hasil contour fill
-    mask_objek = cv2.morphologyEx(mask_objek, cv2.MORPH_CLOSE, kernel_besar)
-
+    # Menghitung total piksel objek
     total_piksel = cv2.countNonZero(mask_objek)
 
     if total_piksel == 0:
@@ -122,8 +134,8 @@ def deteksi_pisang(nama_file):
 
     # Hasil segmentasi
     hasil_segmentasi = cv2.bitwise_and(
-        blur, blur, mask=mask_objek
-    )
+    gambar, gambar, mask=mask_objek
+)
 
     return gambar, hasil_segmentasi, persentase, warna_dominan, kematangan
 
