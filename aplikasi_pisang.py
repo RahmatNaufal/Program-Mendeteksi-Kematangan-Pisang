@@ -5,9 +5,8 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
 
-# ==========================================
+
 # 1. PROSES DETEKSI KEMATANGAN PISANG
-# ==========================================
 
 def deteksi_pisang(nama_file):
     gambar = cv2.imread(nama_file)
@@ -139,10 +138,7 @@ def deteksi_pisang(nama_file):
 
     return gambar, hasil_segmentasi, persentase, warna_dominan, kematangan
 
-
-# ==========================================
 # 2. MEMBUAT JENDELA APLIKASI
-# ==========================================
 
 akar = tk.Tk()
 akar.title("Deteksi Kematangan Pisang")
@@ -160,9 +156,8 @@ gambar_asli_tk = None
 gambar_segmentasi_tk = None
 
 
-# ==========================================
 # 3. BAGIAN JUDUL
-# ==========================================
+
 
 header = tk.Frame(akar, bg=hijau_tua, pady=18)
 header.pack(fill="x")
@@ -184,9 +179,7 @@ tk.Label(
 ).pack(pady=(5, 0))
 
 
-# ==========================================
 # 4. BAGIAN GAMBAR
-# ==========================================
 
 konten = tk.Frame(akar, bg="#F2F5F1")
 konten.pack(fill="both", expand=True, padx=20, pady=15)
@@ -247,9 +240,7 @@ panel_segmentasi, area_segmentasi = buat_panel_gambar(
 panel_segmentasi.pack(fill="both", expand=True, pady=(10, 0))
 
 
-# ==========================================
 # 5. BAGIAN HASIL DETEKSI
-# ==========================================
 
 tk.Label(
     panel_hasil,
@@ -348,9 +339,7 @@ label_kematangan = tk.Label(
 label_kematangan.pack(anchor="w")
 
 
-# ==========================================
 # 6. MEMILIH GAMBAR DAN MENAMPILKAN HASIL
-# ==========================================
 
 def pilih_gambar():
     global gambar_asli_tk, gambar_segmentasi_tk
@@ -432,9 +421,7 @@ def pilih_gambar():
             str(e)
         )
 
-# ==========================================
 # 7. TOMBOL DAN KETERANGAN
-# ==========================================
 
 panel_bawah = tk.Frame(akar, bg="#F2F5F1")
 panel_bawah.pack(fill="x", padx=20, pady=(0, 15))
@@ -517,8 +504,6 @@ tk.Label(
 ).pack(pady=(7, 0))
 
 
-# ==========================================
 # 8. MENJALANKAN APLIKASI
-# ==========================================
 
 akar.mainloop()
