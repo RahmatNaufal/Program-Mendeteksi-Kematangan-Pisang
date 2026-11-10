@@ -7,7 +7,8 @@ import numpy as np
 
 from PyQt5.QtCore import Qt, QRectF, QVariantAnimation, QEasingCurve
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPainter, QPainterPath, QFontDatabase
+    QImage, QPixmap, QFont, QColor, QPainter, QPainterPath, QFontDatabase,
+    QPen
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
@@ -28,6 +29,16 @@ AMBANG_GELAP = 55
 UKURAN_MAKS = 600
 
 
+def ambang(kanal, batas, jenis):
+    """
+    Thresholding satu kanal dengan cv2.threshold, mengembalikan citra biner.
+    THRESH_BINARY     : 255 jika nilai > batas, selain itu 0.
+    THRESH_BINARY_INV : 255 jika nilai <= batas, selain itu 0.
+    """
+    _, biner = cv2.threshold(kanal, batas, 255, jenis)
+    return biner
+
+
 def deteksi_pisang(nama_file):
     gambar = cv2.imread(nama_file)
 
@@ -45,18 +56,21 @@ def deteksi_pisang(nama_file):
     blur = cv2.GaussianBlur(gambar, (5, 5), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-    # SEGMENTASI OBJEK PISANG
-    # Mengambil objek pisang dan menghilangkan latar putih
-    bawah_pisang = np.array([0, 35, 30])
-    atas_pisang = np.array([90, 255, 255])
-    mask_pisang = cv2.inRange(hsv, bawah_pisang, atas_pisang)
+    # SEGMENTASI OBJEK PISANG (thresholding pada kanal H, S, V)
+    # Mengambil objek pisang dan menghilangkan latar putih:
+    #   H <= 90  (corak hijau sampai cokelat)
+    #   S >= 35  (latar putih hampir tidak berwarna, jadi tersingkir)
+    #   V >= 30  (bukan piksel yang terlalu gelap)
+    h, s, v = cv2.split(hsv)
+    mask_h = ambang(h, 90, cv2.THRESH_BINARY_INV)
+    mask_s = ambang(s, 34, cv2.THRESH_BINARY)
+    mask_v = ambang(v, 29, cv2.THRESH_BINARY)
+    mask_pisang = cv2.bitwise_and(cv2.bitwise_and(mask_h, mask_s), mask_v)
 
     # Piksel gelap hampir tidak berwarna (saturasi rendah), jadi lolos dari
     # batas S di atas. Pisang busuk didominasi piksel seperti ini, maka
-    # piksel gelap ikut dimasukkan ke objek.
-    mask_gelap = cv2.inRange(
-        hsv, np.array([0, 0, 0]), np.array([179, 255, AMBANG_GELAP])
-    )
+    # piksel gelap (V <= AMBANG_GELAP) ikut dimasukkan ke objek.
+    mask_gelap = ambang(v, AMBANG_GELAP, cv2.THRESH_BINARY_INV)
     mask_pisang = cv2.bitwise_or(mask_pisang, mask_gelap)
 
     # Menghilangkan noise kecil, lalu menutup celah kecil pada objek
@@ -189,14 +203,45 @@ def blok_matriks(cuplikan, kanal):
     return "\n".join(baris).rstrip()
 
 
+def histogram_objek(hsv, mask):
+    """
+    Histogram kanal H (180 bin), S (256 bin), dan V (256 bin) dengan
+    cv2.calcHist, hanya dihitung pada piksel objek pisang.
+    """
+    mask8 = mask.astype(np.uint8) * 255
+    return {
+        "H": cv2.calcHist([hsv], [0], mask8, [180], [0, 180]).flatten(),
+        "S": cv2.calcHist([hsv], [1], mask8, [256], [0, 256]).flatten(),
+        "V": cv2.calcHist([hsv], [2], mask8, [256], [0, 256]).flatten(),
+    }
+
+
+def ringkas_histogram(hist, n_obj):
+    """Baris teks ringkasan histogram: modus dan beberapa persentase."""
+    h, s, v = hist["H"], hist["S"], hist["V"]
+    n = max(n_obj, 1)
+    return [
+        "Dihitung dengan cv2.calcHist, hanya pada piksel objek.",
+        kv("Modus H", f"{int(h.argmax())}  ({angka(h.max(), 0)} piksel)"),
+        kv("Modus S", f"{int(s.argmax())}  ({angka(s.max(), 0)} piksel)"),
+        kv("Modus V", f"{int(v.argmax())}  ({angka(v.max(), 0)} piksel)"),
+        kv("Piksel H 35-85", f"{angka(h[35:86].sum() / n * 100)}%  (rentang hijau)"),
+        kv("Piksel H 18-34", f"{angka(h[18:35].sum() / n * 100)}%  (rentang kuning)"),
+        kv("Piksel H 2-17", f"{angka(h[2:18].sum() / n * 100)}%  (rentang cokelat)"),
+        kv("Piksel V <= %d" % AMBANG_GELAP, f"{angka(v[:AMBANG_GELAP + 1].sum() / n * 100)}%  (hitam)"),
+    ]
+
+
 def info_citra(nama_file, gambar, segmentasi, mask, persentase, dominan, kematangan):
-    """Mengembalikan (teks_sebelum, teks_sesudah)."""
+    """Mengembalikan (teks_sebelum, teks_sesudah, histogram)."""
     asli = cv2.imread(nama_file)          # citra mentah, sebelum diubah ukuran
     h0, w0, c0 = asli.shape
     h1, w1 = gambar.shape[:2]
 
     blur = cv2.GaussianBlur(gambar, (5, 5), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+
+    hist = histogram_objek(hsv, mask)
 
     ys, xs = np.nonzero(mask)
     n_obj, n_all = int(mask.sum()), h1 * w1
@@ -280,6 +325,7 @@ def info_citra(nama_file, gambar, segmentasi, mask, persentase, dominan, kematan
         ),
         bagian(
             "4. Segmentasi objek pisang",
+            kv("Metode", "cv2.threshold pada kanal H, S, V"),
             kv("Piksel objek", f"{angka(n_obj, 0)}  ({angka(n_obj / n_all * 100)}% dari citra)"),
             kv("Piksel latar", f"{angka(n_all - n_obj, 0)}  ({angka((n_all - n_obj) / n_all * 100)}%)"),
             kv("Kotak pembatas", f"({x0}, {y0}) sampai ({x1}, {y1})"),
@@ -302,9 +348,10 @@ def info_citra(nama_file, gambar, segmentasi, mask, persentase, dominan, kematan
             "Citra HSV (H, S, V)", blok_matriks(cup_hsv, "HSV"), "",
             "Hasil segmentasi (B, G, R)", blok_matriks(cup_seg, "BGR"),
         ),
+        bagian("8. Histogram kanal HSV pada objek", *ringkas_histogram(hist, n_obj)),
     ])
 
-    return sebelum, sesudah
+    return sebelum, sesudah, hist
 
 
 # ==========================================================
@@ -521,10 +568,78 @@ class BarisWarna:
         set_prop(self.nilai, "tebal", tebal)
 
 
-class DialogDetail(QDialog):
-    """Detail citra: satu tab sebelum analisis, satu tab sesudah."""
+class GrafikHistogram(QWidget):
+    """
+    Grafik batang satu histogram. Pita berwarna menandai rentang warna
+    pada klasifikasi, garis putus-putus menandai ambang thresholding.
+    """
 
-    def __init__(self, parent, nama_berkas, teks_sebelum, teks_sesudah):
+    def __init__(self, judul, data, pita=(), garis=()):
+        super().__init__()
+        self._judul, self._data = judul, np.asarray(data, dtype=float)
+        self._pita, self._garis = pita, garis
+        self.setMinimumHeight(130)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor("#FBFCFB"))
+        n = len(self._data)
+        area = QRectF(54, 26, self.width() - 54 - 14, self.height() - 26 - 24)
+        if n == 0 or area.width() <= 0 or area.height() <= 0:
+            return
+        maks = max(self._data.max(), 1.0)
+        lebar = area.width() / n
+
+        for a, b, kode in self._pita:
+            warna = QColor(kode)
+            warna.setAlpha(55)
+            x0 = area.left() + a * lebar
+            p.fillRect(QRectF(x0, area.top(), (b + 1 - a) * lebar, area.height()), warna)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(INK))
+        for i, nilai in enumerate(self._data):
+            if nilai > 0:
+                t = area.height() * nilai / maks
+                p.drawRect(QRectF(
+                    area.left() + i * lebar, area.bottom() - t, max(lebar, 1.0), t
+                ))
+
+        huruf = p.font()
+        huruf.setPointSize(8)
+        p.setFont(huruf)
+        for nilai, teks in self._garis:
+            x = area.left() + nilai * lebar
+            p.setPen(QPen(QColor("#C0392B"), 1, Qt.DashLine))
+            p.drawLine(int(x), int(area.top()), int(x), int(area.bottom()))
+            p.setPen(QColor("#C0392B"))
+            p.drawText(int(x) + 3, int(area.top()) + 11, teks)
+
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QColor(GARIS))
+        p.drawRect(area)
+        p.setPen(QColor(INK))
+        huruf.setBold(True)
+        p.setFont(huruf)
+        p.drawText(int(area.left()), 15, self._judul)
+        huruf.setBold(False)
+        p.setFont(huruf)
+        p.setPen(QColor(MUTED))
+        p.drawText(QRectF(0, area.top() - 2, area.left() - 6, 14),
+                   Qt.AlignRight | Qt.AlignTop, angka(maks, 0))
+        p.drawText(QRectF(0, area.bottom() - 12, area.left() - 6, 14),
+                   Qt.AlignRight | Qt.AlignBottom, "0")
+        p.drawText(int(area.left()), int(self.height()) - 8, "0")
+        p.drawText(int(area.right()) - 24, int(self.height()) - 8, str(n - 1))
+
+
+class DialogDetail(QDialog):
+    """Detail citra: tab sebelum, tab sesudah, dan tab histogram."""
+
+    def __init__(self, parent, nama_berkas, teks_sebelum, teks_sesudah,
+                 histogram=None):
         super().__init__(parent)
         self.setWindowTitle(f"Detail citra: {nama_berkas}")
         self.resize(800, 680)
@@ -549,6 +664,8 @@ class DialogDetail(QDialog):
             editor.setLineWrapMode(QPlainTextEdit.NoWrap)
             editor.setFont(huruf)
             tab.addTab(editor, judul)
+        if histogram:
+            tab.addTab(self._buat_tab_histogram(histogram), "Histogram")
         tata.addWidget(tab, 1)
 
         self.label_info = label("", "keterangan")
@@ -558,6 +675,30 @@ class DialogDetail(QDialog):
         baris.addSpacing(8)
         baris.addWidget(tombol("Simpan .txt", "utama", self.simpan))
         tata.addLayout(baris)
+
+    @staticmethod
+    def _buat_tab_histogram(hist):
+        halaman = QWidget()
+        tata = QVBoxLayout(halaman)
+        tata.setContentsMargins(0, 10, 0, 0)
+        tata.setSpacing(8)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Hue (H) pada objek", hist["H"],
+            pita=[(35, 85, WARNA_DATA["Hijau"]),
+                  (18, 34, WARNA_DATA["Kuning"]),
+                  (2, 17, WARNA_DATA["Cokelat"])],
+            garis=[(90, "H = 90")],
+        ), 1)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Saturation (S) pada objek", hist["S"],
+            garis=[(35, "S = 35")],
+        ), 1)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Value (V) pada objek", hist["V"],
+            pita=[(0, AMBANG_GELAP, WARNA_DATA["Hitam"])],
+            garis=[(30, "V = 30"), (AMBANG_GELAP, "V = 55")],
+        ), 1)
+        return halaman
 
     def salin(self):
         QApplication.clipboard().setText(self._teks_semua)
@@ -728,7 +869,7 @@ class JendelaPisang(QMainWindow):
                 persentase, dominan, kematangan
             )
         except Exception as e:
-            self.info = (f"Detail citra tidak bisa dibuat: {e}",) * 2
+            self.info = (f"Detail citra tidak bisa dibuat: {e}",) * 2 + (None,)
         self.tombol_detail.setEnabled(True)
         self.statusBar().showMessage(
             f"{self.nama_berkas}  (dianalisis pada "
