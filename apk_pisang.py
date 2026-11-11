@@ -1,13 +1,57 @@
+import os
+import sys
+from string import Template
+
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+
+from PyQt5.QtCore import Qt, QRectF, QSize, QVariantAnimation, QEasingCurve
+from PyQt5.QtGui import (
+    QImage, QPixmap, QFont, QColor, QPainter, QPainterPath, QFontDatabase,
+    QPen, QIcon
+)
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QMessageBox,
+    QSizePolicy, QDialog, QTabWidget, QPlainTextEdit, QListWidget,
+    QListWidgetItem, QStackedWidget
+)
 
 
-# ==========================================
+# ==========================================================
 # 1. PROSES DETEKSI KEMATANGAN PISANG
-# ==========================================
+# ==========================================================
+
+# Piksel dengan V (kecerahan) sampai nilai ini dianggap hitam.
+AMBANG_GELAP = 55
+
+# Sisi terpanjang gambar disesuaikan ke ukuran ini (rasio aspek tetap).
+# Gambar 3:2 tetap menjadi 600 x 400 seperti sebelumnya.
+UKURAN_MAKS = 600
+
+
+def ambang(kanal, batas, jenis):
+    """
+    Thresholding satu kanal dengan cv2.threshold, mengembalikan citra biner.
+    THRESH_BINARY     : 255 jika nilai > batas, selain itu 0.
+    THRESH_BINARY_INV : 255 jika nilai <= batas, selain itu 0.
+    """
+    _, biner = cv2.threshold(kanal, batas, 255, jenis)
+    return biner
+
+
+def ke_bgr(citra):
+    """Citra satu kanal (mask, kanal H/S/V) diubah ke 3 kanal agar bisa ditampilkan."""
+    if citra.ndim == 2:
+        return cv2.cvtColor(citra, cv2.COLOR_GRAY2BGR)
+    return citra.copy()
+
+
+def info_mask(mask):
+    """Teks jumlah dan persentase piksel putih pada sebuah mask."""
+    n = cv2.countNonZero(mask)
+    return f"Piksel putih: {angka(n, 0)} ({angka(n / mask.size * 100, 1)}% dari citra)."
+
 
 def deteksi_pisang(nama_file):
     gambar = cv2.imread(nama_file)
@@ -15,134 +59,219 @@ def deteksi_pisang(nama_file):
     if gambar is None:
         raise ValueError("Gambar tidak dapat dibaca.")
 
-    gambar = cv2.resize(gambar, (600, 400))
+    # Daftar tahapan proses untuk ditampilkan di GUI.
+    # Setiap tahap berisi judul, keterangan, dan citra hasil tahap tersebut.
+    langkah = []
+
+    def catat(judul, ket, citra):
+        langkah.append({"judul": judul, "ket": ket, "citra": ke_bgr(citra)})
+
+    # Ukuran disesuaikan tanpa mengubah rasio aspek, jadi gambar potret,
+    # persegi, maupun lanskap tidak gepeng.
+    tinggi0, lebar0 = gambar.shape[:2]
+    skala = UKURAN_MAKS / max(tinggi0, lebar0)
+    gambar = cv2.resize(
+        gambar,
+        (max(1, round(lebar0 * skala)), max(1, round(tinggi0 * skala))),
+    )
+    catat(
+        "Citra asli",
+        f"Berkas dibaca dengan cv2.imread ({angka(lebar0, 0)} × {angka(tinggi0, 0)} piksel), "
+        f"lalu diubah ukurannya menjadi {gambar.shape[1]} × {gambar.shape[0]} piksel "
+        f"dengan rasio aspek tetap (sisi terpanjang {UKURAN_MAKS} piksel).",
+        gambar,
+    )
 
     blur = cv2.GaussianBlur(gambar, (5, 5), 0)
+    catat(
+        "Gaussian blur",
+        "Penghalusan dengan kernel 5 × 5 untuk meredam noise kecil sebelum "
+        "thresholding. Perubahannya halus, terlihat pada tepi dan tekstur kulit.",
+        blur,
+    )
 
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    catat(
+        "Konversi ke HSV",
+        "Citra diubah ke ruang warna HSV dengan cv2.COLOR_BGR2HSV. Ditampilkan "
+        "apa adanya, sehingga warnanya tampak tidak natural: H, S, dan V "
+        "dibaca sebagai B, G, dan R.",
+        hsv,
+    )
 
-    # ---------------------------------------------------------
-    # SEGMENTASI OBJEK PISANG
-    # ---------------------------------------------------------
-    # 1. Segmentasi Warna Pisang (Hijau, Kuning, Cokelat/Oranye)
-    bawah_pisang = np.array([5, 20, 20])
-    atas_pisang = np.array([85, 255, 255])
+    # SEGMENTASI OBJEK PISANG (thresholding pada kanal H, S, V)
+    # Mengambil objek pisang dan menghilangkan latar putih:
+    #   H <= 90  (corak hijau sampai cokelat)
+    #   S >= 35  (latar putih hampir tidak berwarna, jadi tersingkir)
+    #   V >= 30  (bukan piksel yang terlalu gelap)
+    h, s, v = cv2.split(hsv)
+    catat(
+        "Kanal H (Hue)",
+        "Corak warna, bernilai 0 sampai 179, ditampilkan sebagai tingkat "
+        "keabuan. Cokelat, kuning, dan hijau berada pada nilai rendah sampai menengah.",
+        (h.astype(np.float32) * 255 / 179).astype(np.uint8),
+    )
+    catat(
+        "Kanal S (Saturation)",
+        "Kejenuhan warna, bernilai 0 sampai 255. Kulit pisang terang karena "
+        "warnanya pekat, sedangkan latar putih gelap karena hampir tidak berwarna.",
+        s,
+    )
+    catat(
+        "Kanal V (Value)",
+        "Kecerahan, bernilai 0 sampai 255. Bintik, pangkal, dan bagian pisang "
+        "yang menghitam bernilai rendah (gelap).",
+        v,
+    )
 
-    mask_pisang = cv2.inRange(hsv, bawah_pisang, atas_pisang)
+    mask_h = ambang(h, 90, cv2.THRESH_BINARY_INV)
+    mask_s = ambang(s, 34, cv2.THRESH_BINARY)
+    mask_v = ambang(v, 29, cv2.THRESH_BINARY)
+    catat(
+        "Threshold kanal H",
+        "THRESH_BINARY_INV dengan batas 90: piksel dengan H ≤ 90 (corak hijau "
+        "sampai cokelat) menjadi putih. " + info_mask(mask_h),
+        mask_h,
+    )
+    catat(
+        "Threshold kanal S",
+        "THRESH_BINARY dengan batas 34: piksel dengan S ≥ 35 menjadi putih. "
+        "Latar putih yang hampir tidak berwarna tersingkir. " + info_mask(mask_s),
+        mask_s,
+    )
+    catat(
+        "Threshold kanal V",
+        "THRESH_BINARY dengan batas 29: piksel dengan V ≥ 30 menjadi putih. "
+        "Membuang piksel yang terlalu gelap. " + info_mask(mask_v),
+        mask_v,
+    )
 
-    # Simpan mask asli (sebelum dilebarkan) untuk membuang sisa latar putih
-    mask_pisang_asli = mask_pisang.copy()
-
-    # 2. Operasi Morfologi untuk Menyatukan Objek yang Terputus
-    kernel_besar = np.ones((15, 15), np.uint8)
-    kernel_kecil = np.ones((5, 5), np.uint8)
-
-    # Close: Menutup lubang-lubang kecil di dalam pisang
-    mask_pisang = cv2.morphologyEx(mask_pisang, cv2.MORPH_CLOSE, kernel_besar)
-
-    # Dilate: Menyambung bagian kulit pisang yang renggang/terpisah
-    mask_pisang = cv2.dilate(mask_pisang, kernel_kecil, iterations=2)
-
-    # 3. Mencari Kontur Terbesar
-    kontur, _ = cv2.findContours(
+    mask_pisang = cv2.bitwise_and(cv2.bitwise_and(mask_h, mask_s), mask_v)
+    catat(
+        "Gabungan H, S, dan V",
+        "bitwise_and ketiga mask: sebuah piksel harus memenuhi syarat H, S, "
+        "dan V sekaligus. " + info_mask(mask_pisang),
         mask_pisang,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    # Piksel gelap hampir tidak berwarna (saturasi rendah), jadi lolos dari
+    # batas S di atas. Pisang busuk didominasi piksel seperti ini, maka
+    # piksel gelap (V <= AMBANG_GELAP) ikut dimasukkan ke objek.
+    mask_gelap = ambang(v, AMBANG_GELAP, cv2.THRESH_BINARY_INV)
+    catat(
+        "Mask piksel gelap",
+        f"THRESH_BINARY_INV dengan batas {AMBANG_GELAP}: piksel dengan "
+        f"V ≤ {AMBANG_GELAP} dianggap hitam. Piksel ini hampir tidak berwarna "
+        "sehingga lolos dari batas S, padahal bagian dari pisang yang "
+        "menghitam. " + info_mask(mask_gelap),
+        mask_gelap,
+    )
+    mask_pisang = cv2.bitwise_or(mask_pisang, mask_gelap)
+    catat(
+        "Gabungan dengan piksel gelap",
+        "bitwise_or antara mask warna dan mask piksel gelap. " + info_mask(mask_pisang),
+        mask_pisang,
+    )
+
+    # Menghilangkan noise kecil, lalu menutup celah kecil pada objek
+    kernel_kecil = np.ones((3, 3), np.uint8)
+    kernel_sedang = np.ones((7, 7), np.uint8)
+    mask_pisang = cv2.morphologyEx(mask_pisang, cv2.MORPH_OPEN, kernel_kecil)
+    catat(
+        "Morfologi opening",
+        "Opening dengan kernel 3 × 3 (erosi lalu dilasi) menghapus noise "
+        "berupa titik putih kecil. " + info_mask(mask_pisang),
+        mask_pisang,
+    )
+    mask_pisang = cv2.morphologyEx(mask_pisang, cv2.MORPH_CLOSE, kernel_sedang)
+    catat(
+        "Morfologi closing",
+        "Closing dengan kernel 7 × 7 (dilasi lalu erosi) menutup celah dan "
+        "lubang kecil di dalam objek. " + info_mask(mask_pisang),
+        mask_pisang,
+    )
+
+    # Mencari kontur objek
+    kontur, _ = cv2.findContours(
+        mask_pisang, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     if not kontur:
         raise ValueError("Objek pisang tidak ditemukan.")
 
-    mask_objek = np.zeros_like(mask_pisang)
-
-    # Memilih kontur dengan area terbesar (sisir pisang utama)
+    # Mengambil kontur terbesar
     kontur_terbesar = max(kontur, key=cv2.contourArea)
 
-    # Memastikan kontur cukup besar (bukan noise)
     tinggi, lebar = mask_pisang.shape
-    luas_gambar = tinggi * lebar
-
-    if cv2.contourArea(kontur_terbesar) < (luas_gambar * 0.05):
+    if cv2.contourArea(kontur_terbesar) < tinggi * lebar * 0.05:
         raise ValueError("Objek pisang terlalu kecil atau tidak terdeteksi.")
 
-    # Menggambar kontur utama dan mengisi bagian dalamnya secara penuh
+    gambar_kontur = gambar.copy()
+    cv2.drawContours(gambar_kontur, kontur, -1, (0, 165, 255), 1)
+    cv2.drawContours(gambar_kontur, [kontur_terbesar], -1, (0, 255, 0), 2)
+    catat(
+        "Pencarian kontur",
+        f"cv2.findContours menemukan {len(kontur)} kontur. Kontur terbesar "
+        f"(hijau, luas {angka(cv2.contourArea(kontur_terbesar), 0)} piksel) dipilih "
+        "sebagai objek pisang, kontur lain (oranye) diabaikan.",
+        gambar_kontur,
+    )
+
+    # Membuat mask khusus objek pisang
+    mask_objek = np.zeros_like(mask_pisang)
     cv2.drawContours(
-        mask_objek,
-        [kontur_terbesar],
-        -1,
-        255,
-        thickness=cv2.FILLED
+        mask_objek, [kontur_terbesar], -1, 255, thickness=cv2.FILLED
     )
 
-    # ---------------------------------------------------------
-    # PERBAIKAN: MEMBUANG TEPI PUTIH PADA HASIL SEGMENTASI
-    # ---------------------------------------------------------
-    # a. Mask hasil kontur hanya diambil di area yang benar-benar berwarna
-    #    pisang (latar putih/abu yang ikut terlebar akibat dilate dibuang)
-    mask_objek = cv2.bitwise_and(mask_objek, mask_pisang_asli)
-
-    # b. Tutup lubang kecil di dalam pisang (bagian terang/mengkilap)
-    mask_objek = cv2.morphologyEx(mask_objek, cv2.MORPH_CLOSE, kernel_kecil)
-
-    # c. Isi ulang kontur terbesar agar bagian dalam tetap penuh
-    kontur2, _ = cv2.findContours(
-        mask_objek,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not kontur2:
-        raise ValueError("Objek pisang tidak ditemukan.")
-
-    mask_objek = np.zeros_like(mask_objek)
-    cv2.drawContours(
-        mask_objek,
-        [max(kontur2, key=cv2.contourArea)],
-        -1,
-        255,
-        thickness=cv2.FILLED
-    )
-
-    # d. Kikis tepi 2 piksel agar piksel campuran (pisang + putih) hilang
-    mask_objek = cv2.erode(mask_objek, np.ones((3, 3), np.uint8), iterations=2)
-
-    # e. Haluskan tepi mask
-    mask_objek = cv2.GaussianBlur(mask_objek, (3, 3), 0)
-    _, mask_objek = cv2.threshold(mask_objek, 127, 255, cv2.THRESH_BINARY)
-
+    # Menghitung total piksel objek
     total_piksel = cv2.countNonZero(mask_objek)
 
     if total_piksel == 0:
         raise ValueError("Area objek pisang kosong.")
 
-    # Rentang HSV untuk setiap warna
+    catat(
+        "Mask objek pisang",
+        "Kontur terbesar diisi penuh (cv2.FILLED) menjadi mask objek. "
+        f"Total piksel objek: {angka(total_piksel, 0)} "
+        f"({angka(total_piksel / mask_objek.size * 100, 1)}% dari citra).",
+        mask_objek,
+    )
+
+    # Hasil segmentasi
+    hasil_segmentasi = cv2.bitwise_and(gambar, gambar, mask=mask_objek)
+    catat(
+        "Hasil segmentasi",
+        "bitwise_and citra dengan mask objek: hanya piksel pisang yang "
+        "dipertahankan, latar menjadi hitam.",
+        hasil_segmentasi,
+    )
+
+    # Rentang HSV untuk setiap warna.
+    # Hitam (V sampai AMBANG_GELAP) untuk kategori busuk. Batas bawah V pada
+    # warna lain berada tepat di atasnya agar rentangnya tidak tumpang tindih.
+    v_min = AMBANG_GELAP + 1
     rentang_warna = {
-        "Hijau": (
-            np.array([35, 40, 40]),
-            np.array([85, 255, 255])
-        ),
-        "Kuning": (
-            np.array([18, 50, 50]),
-            np.array([34, 255, 255])
-        ),
-        "Cokelat": (
-            np.array([2, 40, 20]),
-            np.array([17, 255, 200])
-        )
+        "Hijau": (np.array([35, 40, v_min]), np.array([85, 255, 255])),
+        "Kuning": (np.array([18, 50, v_min]), np.array([34, 255, 255])),
+        "Cokelat": (np.array([2, 40, v_min]), np.array([17, 255, 200])),
+        "Hitam": (np.array([0, 0, 0]), np.array([179, 255, AMBANG_GELAP])),
     }
 
     persentase = {}
 
     for warna, (bawah, atas) in rentang_warna.items():
         mask_warna = cv2.inRange(hsv, bawah, atas)
-
-        mask_warna = cv2.bitwise_and(
-            mask_warna, mask_objek
-        )
-
+        mask_warna = cv2.bitwise_and(mask_warna, mask_objek)
         jumlah = cv2.countNonZero(mask_warna)
-
         persentase[warna] = jumlah / total_piksel * 100
+        catat(
+            f"Warna {warna}",
+            f"cv2.inRange dengan rentang H {bawah[0]} sampai {atas[0]}, "
+            f"S {bawah[1]} sampai {atas[1]}, V {bawah[2]} sampai {atas[2]}, "
+            f"dibatasi pada objek. Piksel {warna.lower()}: {angka(jumlah, 0)} "
+            f"({angka(persentase[warna], 1)}% dari objek).",
+            cv2.bitwise_and(gambar, gambar, mask=mask_warna),
+        )
 
     # Menentukan warna dominan
     warna_dominan = max(persentase, key=persentase.get)
@@ -150,387 +279,921 @@ def deteksi_pisang(nama_file):
     klasifikasi = {
         "Hijau": "Belum Matang",
         "Kuning": "Matang",
-        "Cokelat": "Terlalu Matang"
+        "Cokelat": "Terlalu Matang",
+        "Hitam": "Busuk",
     }
 
     kematangan = klasifikasi[warna_dominan]
 
-    # Hasil segmentasi (memakai gambar asli agar tetap tajam)
-    hasil_segmentasi = cv2.bitwise_and(
-        gambar, gambar, mask=mask_objek
+    catat(
+        "Klasifikasi kematangan",
+        f"Warna dominan adalah {warna_dominan.lower()} "
+        f"({angka(persentase[warna_dominan], 1)}% dari objek), maka pisang "
+        f"tergolong {kematangan.lower()}. Aturan: hijau = belum matang, "
+        "kuning = matang, cokelat = terlalu matang, hitam = busuk.",
+        hasil_segmentasi,
     )
 
-    return gambar, hasil_segmentasi, persentase, warna_dominan, kematangan
+    return (
+        gambar, hasil_segmentasi, persentase, warna_dominan, kematangan,
+        mask_objek > 0, langkah,
+    )
 
 
-# ==========================================
-# 2. MEMBUAT JENDELA APLIKASI
-# ==========================================
+# ==========================================================
+# 2. INFORMASI DETAIL CITRA (SEBELUM DAN SESUDAH ANALISIS)
+#    Hanya membaca hasil deteksi_pisang(), tidak mengubahnya.
+# ==========================================================
 
-akar = tk.Tk()
-akar.title("Deteksi Kematangan Pisang")
-akar.geometry("900x720")
-akar.minsize(700, 620)
-akar.configure(bg="#F2F5F1")
-
-hijau_tua = "#D7C607"
-hijau = "#000202"
-putih = "#FFFFFF"
-teks = "#000D05"
-abu = "#000E04"
-
-gambar_asli_tk = None
-gambar_segmentasi_tk = None
-hasil_terakhir = None   # menyimpan hasil analisis untuk jendela analisis warna
-
-warna_tampilan = {
-    "Hijau": "#45965B",
-    "Kuning": "#E5B932",
-    "Cokelat": "#956044"
-}
-
-# Warna teks hasil kematangan
-warna_kematangan = {
-    "Belum Matang": "#2E8B4A",
-    "Matang": "#C9A100",
-    "Terlalu Matang": "#8B4F2B"
-}
+def angka(x, d=2):
+    """Format Indonesia: titik untuk ribuan, koma untuk desimal."""
+    return f"{x:,.{d}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 
-# ==========================================
-# 3. BAGIAN JUDUL
-# ==========================================
-
-header = tk.Frame(akar, bg=hijau_tua, pady=18)
-header.pack(fill="x")
-
-tk.Label(
-    header,
-    text="DETEKSI KEMATANGAN PISANG",
-    font=("Arial", 21, "bold"),
-    fg=putih,
-    bg=hijau_tua
-).pack()
-
-tk.Label(
-    header,
-    text="Pengolahan Citra Digital | Metode HSV",
-    font=("Arial", 10),
-    fg="#FFFFFF",
-    bg=hijau_tua
-).pack(pady=(5, 0))
+def format_ukuran(n):
+    for satuan in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{angka(n, 0 if satuan == 'B' else 1)} {satuan}"
+        n /= 1024
+    return f"{angka(n, 1)} GB"
 
 
-# ==========================================
-# 4. BAGIAN GAMBAR (HANYA GAMBAR YANG DIMASUKKAN)
-# ==========================================
-
-konten = tk.Frame(akar, bg="#F2F5F1")
-konten.pack(fill="both", expand=True, padx=20, pady=15)
-
-bingkai_gambar = tk.Frame(
-    konten,
-    bg=putih,
-    padx=10,
-    pady=10,
-    highlightbackground="#DCE5DC",
-    highlightthickness=1
-)
-bingkai_gambar.pack(fill="both", expand=True)
-
-tk.Label(
-    bingkai_gambar,
-    text="GAMBAR PISANG",
-    font=("Arial", 11, "bold"),
-    bg=putih,
-    fg=teks
-).pack(pady=(0, 8))
-
-area_asli = tk.Label(
-    bingkai_gambar,
-    text="Belum ada gambar",
-    bg="#E8ECE7",
-    fg=abu,
-    width=35,
-    height=12
-)
-area_asli.pack(fill="both", expand=True)
+def bagian(judul, *isi):
+    return "\n".join([judul, "-" * len(judul), *isi])
 
 
-# ==========================================
-# 5. BAGIAN HASIL KEMATANGAN
-# ==========================================
-
-panel_hasil = tk.Frame(
-    konten,
-    bg=putih,
-    padx=18,
-    pady=12,
-    highlightbackground="#DCE5DC",
-    highlightthickness=1
-)
-panel_hasil.pack(fill="x", pady=(12, 0))
-
-tk.Label(
-    panel_hasil,
-    text="TINGKAT KEMATANGAN",
-    font=("Arial", 9, "bold"),
-    bg=putih,
-    fg=abu
-).pack()
-
-label_kematangan = tk.Label(
-    panel_hasil,
-    text="Belum dianalisis",
-    font=("Arial", 22, "bold"),
-    bg=putih,
-    fg=hijau_tua
-)
-label_kematangan.pack(pady=(4, 0))
+def kv(label, nilai):
+    return f"{label:<20}: {nilai}"
 
 
-# ==========================================
-# 6. JENDELA ANALISIS WARNA
-# ==========================================
-
-def tampilkan_analisis():
-    if hasil_terakhir is None:
-        messagebox.showinfo(
-            "Belum ada data",
-            "Pilih gambar terlebih dahulu."
+def tabel_statistik(citra, kanal):
+    baris = ["  kanal   min   maks   rata-rata   simpang baku"]
+    for i, nama in enumerate(kanal):
+        k = citra[:, :, i]
+        baris.append(
+            f"  {nama:<5} {int(k.min()):5d} {int(k.max()):6d} "
+            f"{k.mean():11.2f} {k.std():14.2f}".replace(".", ",")
         )
-        return
-
-    global gambar_segmentasi_tk
-
-    jendela = tk.Toplevel(akar)
-    jendela.title("Analisis Warna")
-    jendela.configure(bg="#F2F5F1")
-    jendela.resizable(False, False)
-    jendela.transient(akar)
-
-    isi = tk.Frame(jendela, bg=putih, padx=20, pady=18,
-                   highlightbackground="#DCE5DC", highlightthickness=1)
-    isi.pack(padx=15, pady=15)
-
-    tk.Label(
-        isi, text="ANALISIS WARNA",
-        font=("Arial", 14, "bold"), bg=putih, fg=hijau_tua
-    ).pack(anchor="w", pady=(0, 10))
-
-    # Hasil segmentasi
-    tk.Label(
-        isi, text="Hasil Segmentasi",
-        font=("Arial", 10, "bold"), bg=putih, fg=teks
-    ).pack(anchor="w", pady=(0, 6))
-
-    foto_seg = Image.fromarray(
-        cv2.cvtColor(hasil_terakhir["segmentasi"], cv2.COLOR_BGR2RGB)
-    )
-    foto_seg.thumbnail((420, 280))
-    gambar_segmentasi_tk = ImageTk.PhotoImage(foto_seg)
-
-    tk.Label(isi, image=gambar_segmentasi_tk, bg="#E8ECE7").pack(pady=(0, 14))
-
-    # Persentase warna
-    tk.Label(
-        isi, text="Persentase warna",
-        font=("Arial", 10, "bold"), bg=putih, fg=teks
-    ).pack(anchor="w", pady=(0, 8))
-
-    for warna, kode_warna in warna_tampilan.items():
-        nilai = hasil_terakhir["persentase"][warna]
-
-        baris = tk.Frame(isi, bg=putih)
-        baris.pack(fill="x")
-
-        tk.Label(baris, text=warna, font=("Arial", 10),
-                 bg=putih, fg=teks).pack(side="left")
-        tk.Label(baris, text=f"{nilai:.2f}%", font=("Arial", 10, "bold"),
-                 bg=putih, fg=teks).pack(side="right")
-
-        kanvas = tk.Canvas(isi, width=420, height=12,
-                           bg="#E8ECE7", highlightthickness=0)
-        kanvas.pack(fill="x", pady=(2, 10))
-
-        panjang = min(max(nilai, 0), 100) / 100 * 420
-        kanvas.create_rectangle(0, 0, panjang, 12, fill=kode_warna, outline="")
-
-    tk.Frame(isi, bg="#DCE5DC", height=1).pack(fill="x", pady=8)
-
-    tk.Label(
-        isi, text="WARNA DOMINAN",
-        font=("Arial", 9, "bold"), bg=putih, fg=abu
-    ).pack(anchor="w", pady=(0, 4))
-
-    tk.Label(
-        isi, text=hasil_terakhir["dominan"],
-        font=("Arial", 17, "bold"), bg=putih,
-        fg=warna_tampilan[hasil_terakhir["dominan"]]
-    ).pack(anchor="w")
-
-    tk.Button(
-        isi, text="TUTUP", command=jendela.destroy,
-        font=("Arial", 10, "bold"), bg="#68756C", fg="white",
-        activebackground="#4B554E", activeforeground="white",
-        relief="flat", padx=16, pady=6, cursor="hand2"
-    ).pack(pady=(14, 0))
+    return "\n".join(baris)
 
 
-# ==========================================
-# 7. MEMILIH GAMBAR DAN MENAMPILKAN HASIL
-# ==========================================
+def potong(citra, cx, cy, ukuran=5):
+    """Cuplikan matriks ukuran x ukuran di sekitar titik (cx, cy)."""
+    h, w = citra.shape[:2]
+    u = min(ukuran, h, w)
+    x0 = int(np.clip(cx - u // 2, 0, w - u))
+    y0 = int(np.clip(cy - u // 2, 0, h - u))
+    return citra[y0:y0 + u, x0:x0 + u], x0, y0
 
-def pilih_gambar():
-    global gambar_asli_tk, hasil_terakhir
 
-    nama_file = filedialog.askopenfilename(
-        title="Pilih gambar pisang",
-        filetypes=[
-            ("Gambar", "*.jpg *.jpeg *.png *.bmp"),
-            ("Semua file", "*.*")
+def blok_matriks(cuplikan, kanal):
+    baris = []
+    for i, nama in enumerate(kanal):
+        baris.append(f"  Kanal {nama}")
+        baris += [
+            "    " + "  ".join(f"{int(v):3d}" for v in b)
+            for b in cuplikan[:, :, i]
         ]
+        baris.append("")
+    return "\n".join(baris).rstrip()
+
+
+def histogram_objek(hsv, mask):
+    """
+    Histogram kanal H (180 bin), S (256 bin), dan V (256 bin) dengan
+    cv2.calcHist, hanya dihitung pada piksel objek pisang.
+    """
+    mask8 = mask.astype(np.uint8) * 255
+    return {
+        "H": cv2.calcHist([hsv], [0], mask8, [180], [0, 180]).flatten(),
+        "S": cv2.calcHist([hsv], [1], mask8, [256], [0, 256]).flatten(),
+        "V": cv2.calcHist([hsv], [2], mask8, [256], [0, 256]).flatten(),
+    }
+
+
+def ringkas_histogram(hist, n_obj):
+    """Baris teks ringkasan histogram: modus dan beberapa persentase."""
+    h, s, v = hist["H"], hist["S"], hist["V"]
+    n = max(n_obj, 1)
+    return [
+        "Dihitung dengan cv2.calcHist, hanya pada piksel objek.",
+        kv("Modus H", f"{int(h.argmax())}  ({angka(h.max(), 0)} piksel)"),
+        kv("Modus S", f"{int(s.argmax())}  ({angka(s.max(), 0)} piksel)"),
+        kv("Modus V", f"{int(v.argmax())}  ({angka(v.max(), 0)} piksel)"),
+        kv("Piksel H 35-85", f"{angka(h[35:86].sum() / n * 100)}%  (rentang hijau)"),
+        kv("Piksel H 18-34", f"{angka(h[18:35].sum() / n * 100)}%  (rentang kuning)"),
+        kv("Piksel H 2-17", f"{angka(h[2:18].sum() / n * 100)}%  (rentang cokelat)"),
+        kv("Piksel V <= %d" % AMBANG_GELAP, f"{angka(v[:AMBANG_GELAP + 1].sum() / n * 100)}%  (hitam)"),
+    ]
+
+
+def info_citra(nama_file, gambar, segmentasi, mask, persentase, dominan, kematangan):
+    """Mengembalikan (teks_sebelum, teks_sesudah, histogram)."""
+    asli = cv2.imread(nama_file)          # citra mentah, sebelum diubah ukuran
+    h0, w0, c0 = asli.shape
+    h1, w1 = gambar.shape[:2]
+
+    blur = cv2.GaussianBlur(gambar, (5, 5), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+
+    hist = histogram_objek(hsv, mask)
+
+    ys, xs = np.nonzero(mask)
+    n_obj, n_all = int(mask.sum()), h1 * w1
+
+    if n_obj:
+        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        cx, cy = int(xs.mean()), int(ys.mean())
+        rata_bgr, rata_hsv = gambar[mask].mean(axis=0), hsv[mask].mean(axis=0)
+    else:
+        cx, cy = w1 // 2, h1 // 2
+        x0 = x1 = cx
+        y0 = y1 = cy
+        rata_bgr = rata_hsv = np.zeros(3)
+
+    # ---------- Sebelum analisis ----------
+    cup0, ax, ay = potong(asli, cx * w0 // w1, cy * h0 // h1)
+    sebelum = "\n\n".join([
+        bagian(
+            "Citra asli (belum diproses)",
+            kv("Berkas", os.path.basename(nama_file)),
+            kv("Ukuran berkas", format_ukuran(os.path.getsize(nama_file))),
+            kv("Dimensi", f"{angka(w0, 0)} × {angka(h0, 0)} piksel (lebar × tinggi)"),
+            kv("Bentuk matriks", f"({h0}, {w0}, {c0})  [tinggi, lebar, kanal]"),
+            kv("Kanal", f"{c0}  (B, G, R)"),
+            kv("Tipe data", asli.dtype),
+            kv("Rasio aspek", angka(w0 / h0)),
+            kv("Jumlah piksel", angka(h0 * w0, 0)),
+            kv("Jumlah elemen", angka(asli.size, 0)),
+            kv("Memori matriks", format_ukuran(asli.nbytes)),
+        ),
+        bagian("Statistik per kanal", tabel_statistik(asli, "BGR")),
+        bagian(
+            f"Cuplikan matriks {cup0.shape[0]}×{cup0.shape[1]} dari titik ({ax}, {ay})",
+            "Diambil di sekitar pusat pisang pada citra asli.", "",
+            blok_matriks(cup0, "BGR"),
+        ),
+    ])
+
+    # ---------- Sesudah analisis ----------
+    selisih_blur = np.abs(gambar.astype(np.int16) - blur.astype(np.int16)).mean()
+
+    komposisi, terklasifikasi = [], 0
+    for warna, nilai in persentase.items():
+        n = int(round(nilai / 100 * n_obj))
+        terklasifikasi += n
+        komposisi.append(kv(warna, f"{angka(n, 0):>9} piksel  {angka(nilai):>7}%"))
+    komposisi.append(kv(
+        "Lainnya",
+        f"{angka(max(0, n_obj - terklasifikasi), 0):>9} piksel  "
+        f"{angka(max(0.0, 100 - sum(persentase.values()))):>7}%",
+    ))
+
+    banding = [
+        "Sebelum: seluruh citra asli.  Sesudah: hanya piksel objek.",
+        "  kanal   sebelum   sesudah   selisih",
+    ]
+    for i, k in enumerate("BGR"):
+        a, b = asli[:, :, i].mean(), rata_bgr[i]
+        banding.append(f"  {k:<5} {a:8.2f} {b:9.2f} {b - a:+9.2f}".replace(".", ","))
+
+    cup1, bx, by = potong(gambar, cx, cy)
+    cup_hsv, _, _ = potong(hsv, cx, cy)
+    cup_seg, _, _ = potong(segmentasi, cx, cy)
+
+    sesudah = "\n\n".join([
+        bagian(
+            "1. Pengubahan ukuran",
+            kv("Dimensi", f"{w0} × {h0}  menjadi  {w1} × {h1} piksel"),
+            kv("Faktor skala", f"x {angka(w1 / w0, 3)},  y {angka(h1 / h0, 3)}"),
+            kv("Bentuk matriks", gambar.shape),
+        ),
+        bagian(
+            "2. Gaussian blur",
+            kv("Kernel", "5 × 5, sigma otomatis"),
+            kv("Selisih rata-rata", f"{angka(selisih_blur)} tingkat keabuan per elemen"),
+        ),
+        bagian(
+            "3. Konversi ke HSV",
+            "Rentang OpenCV: H 0 sampai 179, S dan V 0 sampai 255.",
+            tabel_statistik(hsv, "HSV"),
+        ),
+        bagian(
+            "4. Segmentasi objek pisang",
+            kv("Metode", "cv2.threshold pada kanal H, S, V"),
+            kv("Piksel objek", f"{angka(n_obj, 0)}  ({angka(n_obj / n_all * 100)}% dari citra)"),
+            kv("Piksel latar", f"{angka(n_all - n_obj, 0)}  ({angka((n_all - n_obj) / n_all * 100)}%)"),
+            kv("Kotak pembatas", f"({x0}, {y0}) sampai ({x1}, {y1})"),
+            kv("Ukuran kotak", f"{x1 - x0 + 1} × {y1 - y0 + 1} piksel"),
+            kv("Titik pusat", f"({cx}, {cy})"),
+            kv("Rata-rata B, G, R", ", ".join(angka(x) for x in rata_bgr)),
+            kv("Rata-rata H, S, V", ", ".join(angka(x) for x in rata_hsv)),
+        ),
+        bagian(
+            "5. Komposisi warna pada objek", *komposisi,
+            "Jumlah piksel dihitung dari persentase.", "",
+            kv("Warna dominan", dominan),
+            kv("Klasifikasi", kematangan),
+        ),
+        bagian("6. Rata-rata nilai sebelum dan sesudah segmentasi", *banding),
+        bagian(
+            f"7. Cuplikan matriks {cup1.shape[0]}×{cup1.shape[1]} dari titik ({bx}, {by})",
+            "Titik yang sama pada tiga tahap. Nilai 0 pada hasil segmentasi adalah latar.", "",
+            "Citra yang diubah ukuran (B, G, R)", blok_matriks(cup1, "BGR"), "",
+            "Citra HSV (H, S, V)", blok_matriks(cup_hsv, "HSV"), "",
+            "Hasil segmentasi (B, G, R)", blok_matriks(cup_seg, "BGR"),
+        ),
+        bagian("8. Histogram kanal HSV pada objek", *ringkas_histogram(hist, n_obj)),
+    ])
+
+    return sebelum, sesudah, hist
+
+
+# ==========================================================
+# 3. DESAIN
+#    Antarmuka netral: satu-satunya warna adalah warna data.
+#    Panggung foto gelap karena hasil segmentasi berlatar hitam.
+# ==========================================================
+
+INK, MUTED, GARIS = "#1C2124", "#5F6A71", "#D3D8DA"
+PANEL, STAGE, STAGE_TEKS = "#F2F4F3", "#1E2225", "#8E989E"
+
+WARNA_DATA = {
+    "Hijau": "#7FA83A",
+    "Kuning": "#EFC31A",
+    "Cokelat": "#7B4A24",
+    "Hitam": "#2A2522",
+}
+WARNA_LAINNYA = "#D9DDDE"
+
+PESAN_AWAL = "Mendukung berkas JPG, PNG, dan BMP."
+TEKS_KOSONG = "Buka foto pisang untuk melihat tingkat kematangannya."
+
+STYLE = Template("""
+QMainWindow, QDialog { background: $PANEL; }
+QFrame#stage { background: $STAGE; }
+QFrame#panel { background: $PANEL; border-left: 1px solid $GARIS; }
+
+QLabel#area { color: $STAGE_TEKS; font-size: 13px; background: transparent; }
+QLabel#area[kosong="true"] { border: 1px solid #343A3E; }
+QLabel#caption { color: $STAGE_TEKS; font-size: 12px; }
+
+QLabel#judulLangkah { color: #F2F4F3; font-size: 18px; font-weight: 700; }
+QLabel#ketLangkah { color: #AEB7BC; font-size: 13px; }
+QListWidget#daftar {
+    background: $STAGE; border: none; outline: 0;
+    color: #C3CBD0; font-size: 12px;
+}
+QListWidget#daftar::item { padding: 5px 6px; border-radius: 4px; }
+QListWidget#daftar::item:hover { background: #2A3034; }
+QListWidget#daftar::item:selected { background: #394146; color: white; }
+QListWidget#daftar QScrollBar:vertical { background: $STAGE; width: 10px; }
+QListWidget#daftar QScrollBar::handle:vertical {
+    background: #3D454A; border-radius: 4px; min-height: 24px;
+}
+QListWidget#daftar QScrollBar::add-line:vertical,
+QListWidget#daftar QScrollBar::sub-line:vertical { height: 0; }
+
+QLabel#verdict { color: $INK; font-size: 30px; font-weight: 700; }
+QLabel#keterangan { color: $MUTED; font-size: 13px; }
+QLabel#namaWarna, QLabel#nilaiWarna { color: $INK; font-size: 13px; }
+QLabel[tebal="true"] { font-weight: 700; }
+
+QPushButton#utama, QPushButton#sekunder {
+    border-radius: 4px; padding: 10px 16px; min-height: 20px;
+    font-size: 13px; font-weight: 600;
+}
+QPushButton#utama { background: $INK; color: white; border: 2px solid $INK; }
+QPushButton#utama:hover { background: #343C41; border-color: #343C41; }
+QPushButton#utama:pressed { background: #0F1214; border-color: #0F1214; }
+QPushButton#sekunder {
+    background: transparent; color: $INK; border: 2px solid #C4CACC;
+}
+QPushButton#sekunder:hover { background: #E6E9E8; }
+QPushButton#sekunder:pressed { background: #D9DDDC; }
+QPushButton#sekunder:disabled { color: #A3ACB1; border-color: #DEE2E3; }
+QPushButton:focus { border-color: #4A7BD0; }
+
+QTabWidget::pane { border: none; }
+QTabBar::tab {
+    padding: 8px 14px; margin-right: 6px; color: $MUTED; font-size: 13px;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover:!selected { color: $INK; }
+QTabBar::tab:selected {
+    color: $INK; font-weight: 600; border-bottom: 2px solid $INK;
+}
+QPlainTextEdit#detail {
+    background: #FBFCFB; color: $INK; border: 1px solid $GARIS; padding: 10px;
+    selection-background-color: #F6E39A; selection-color: $INK;
+}
+
+QStatusBar {
+    background: $PANEL; color: $MUTED; font-size: 12px;
+    border-top: 1px solid $GARIS;
+}
+QStatusBar::item { border: none; }
+""").substitute(
+    INK=INK, MUTED=MUTED, GARIS=GARIS, PANEL=PANEL,
+    STAGE=STAGE, STAGE_TEKS=STAGE_TEKS,
+)
+
+
+def set_prop(widget, nama, nilai):
+    widget.setProperty(nama, nilai)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+def numpy_ke_pixmap(bgr):
+    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    h, w, ch = rgb.shape
+    return QPixmap.fromImage(
+        QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
     )
 
-    if not nama_file:
-        return
 
-    try:
-        gambar, segmentasi, persentase, dominan, kematangan = (
-            deteksi_pisang(nama_file)
+def label(teks="", nama=None, wrap=False, rata=None):
+    lb = QLabel(teks)
+    if nama:
+        lb.setObjectName(nama)
+    lb.setWordWrap(wrap)
+    if rata:
+        lb.setAlignment(rata)
+    return lb
+
+
+def tombol(teks, nama, fungsi, pintasan=None):
+    tb = QPushButton(teks)
+    tb.setObjectName(nama)
+    tb.setCursor(Qt.PointingHandCursor)
+    tb.clicked.connect(fungsi)
+    if pintasan:
+        tb.setShortcut(pintasan)
+    return tb
+
+
+# ==========================================================
+# 4. KOMPONEN
+# ==========================================================
+
+class AreaGambar(QLabel):
+    """Menampilkan gambar dengan rasio asli, menyesuaikan ukuran jendela."""
+
+    def __init__(self, teks_kosong):
+        super().__init__()
+        self._teks_kosong = teks_kosong
+        self._pixmap = None
+        self.setObjectName("area")
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(200, 150)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.hapus()
+
+    def set_gambar(self, pixmap):
+        self._pixmap = pixmap
+        set_prop(self, "kosong", False)
+        self._perbarui()
+
+    def hapus(self):
+        self._pixmap = None
+        self.clear()
+        self.setText(self._teks_kosong)
+        set_prop(self, "kosong", True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._perbarui()
+
+    def _perbarui(self):
+        if self._pixmap is not None:
+            self.setPixmap(self._pixmap.scaled(
+                self.width(), self.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation
+            ))
+
+
+class PanelTahapan(QWidget):
+    """
+    Menampilkan setiap tahap proses deteksi. Daftar tahap (dengan gambar
+    kecil) ada di kiri, tahap yang dipilih tampil besar di kanan beserta
+    penjelasannya. Pindah tahap dengan klik atau tombol panah atas/bawah.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._pixmaps, self._langkah = [], []
+
+        tata = QHBoxLayout(self)
+        tata.setContentsMargins(0, 0, 0, 0)
+        tata.setSpacing(24)
+
+        self.daftar = QListWidget()
+        self.daftar.setObjectName("daftar")
+        self.daftar.setFixedWidth(240)
+        self.daftar.setIconSize(QSize(84, 56))
+        self.daftar.setSpacing(2)
+        self.daftar.setWordWrap(True)
+        self.daftar.setTextElideMode(Qt.ElideRight)
+        self.daftar.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.daftar.currentRowChanged.connect(self._tampil)
+        tata.addWidget(self.daftar)
+
+        kanan = QVBoxLayout()
+        kanan.setSpacing(10)
+        self.judul = label("", "judulLangkah", wrap=True)
+        self.area = AreaGambar("Belum ada tahapan proses.")
+        self.ket = label("", "ketLangkah", wrap=True)
+        self.nomor = label("", "caption", rata=Qt.AlignCenter)
+        kanan.addWidget(self.judul)
+        kanan.addWidget(self.area, 1)
+        kanan.addWidget(self.ket)
+        kanan.addWidget(self.nomor)
+        tata.addLayout(kanan, 1)
+
+    def set_langkah(self, langkah):
+        self.daftar.blockSignals(True)
+        self.daftar.clear()
+        self._langkah = langkah
+        self._pixmaps = []
+        for i, l in enumerate(langkah):
+            pix = numpy_ke_pixmap(l["citra"])
+            self._pixmaps.append(pix)
+            ikon = QIcon(pix.scaled(
+                84, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            ))
+            self.daftar.addItem(QListWidgetItem(ikon, f"{i + 1}. {l['judul']}"))
+        self.daftar.blockSignals(False)
+        self.daftar.setCurrentRow(0)
+        self._tampil(0)
+
+    def kosongkan(self):
+        self.daftar.blockSignals(True)
+        self.daftar.clear()
+        self.daftar.blockSignals(False)
+        self._langkah, self._pixmaps = [], []
+        self.area.hapus()
+        self.judul.setText("")
+        self.ket.setText("")
+        self.nomor.setText("")
+
+    def _tampil(self, baris):
+        if not 0 <= baris < len(self._langkah):
+            return
+        l = self._langkah[baris]
+        self.judul.setText(f"{baris + 1}. {l['judul']}")
+        self.ket.setText(l["ket"])
+        self.area.set_gambar(self._pixmaps[baris])
+        self.nomor.setText(
+            f"Tahap {baris + 1} dari {len(self._langkah)}  ·  "
+            "pakai tombol panah atas/bawah untuk berpindah"
         )
 
-        # Mengubah BGR menjadi RGB untuk tampilan
-        asli_rgb = cv2.cvtColor(
-            gambar, cv2.COLOR_BGR2RGB
+
+class JalurWarna(QWidget):
+    """
+    Satu jalur horizontal yang diisi seperti kulit pisang yang menua:
+    hijau, kuning, cokelat, hitam. Lebar tiap bagian sama dengan
+    persentasenya; sisa piksel yang tidak masuk rentang berwarna abu-abu.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(40)
+        self._persen, self._t = {}, 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(450)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._ubah)
+
+    def _ubah(self, nilai):
+        self._t = float(nilai)
+        self.update()
+
+    def atur(self, persen=None):
+        """Isi jalur dengan animasi; tanpa argumen, kosongkan."""
+        self._anim.stop()
+        self._persen = dict(persen or {})
+        if self._persen:
+            self._anim.start()
+        else:
+            self._t = 0.0
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        bentuk = QPainterPath()
+        bentuk.addRoundedRect(r, 4, 4)
+        p.setClipPath(bentuk)
+        p.fillRect(r, QColor(WARNA_LAINNYA))
+
+        x = r.left()
+        for warna, kode in WARNA_DATA.items():
+            lebar = r.width() * self._persen.get(warna, 0) / 100 * self._t
+            p.fillRect(QRectF(x, r.top(), lebar, r.height()), QColor(kode))
+            x += lebar
+
+
+class BarisWarna:
+    """Satu baris legenda: kotak warna, nama, persentase."""
+
+    def __init__(self, grid, indeks, nama, kode):
+        swatch = QLabel()
+        swatch.setFixedSize(12, 12)
+        swatch.setStyleSheet(f"background: {kode}; border-radius: 2px;")
+        self.nama = label(nama, "namaWarna")
+        self.nilai = label("", "nilaiWarna", rata=Qt.AlignRight | Qt.AlignVCenter)
+        for kolom, widget in enumerate((swatch, self.nama, self.nilai)):
+            grid.addWidget(widget, indeks, kolom)
+
+    def isi(self, teks, tebal=False):
+        self.nilai.setText(teks)
+        set_prop(self.nama, "tebal", tebal)
+        set_prop(self.nilai, "tebal", tebal)
+
+
+class GrafikHistogram(QWidget):
+    """
+    Grafik batang satu histogram. Pita berwarna menandai rentang warna
+    pada klasifikasi, garis putus-putus menandai ambang thresholding.
+    """
+
+    def __init__(self, judul, data, pita=(), garis=()):
+        super().__init__()
+        self._judul, self._data = judul, np.asarray(data, dtype=float)
+        self._pita, self._garis = pita, garis
+        self.setMinimumHeight(130)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor("#FBFCFB"))
+        n = len(self._data)
+        area = QRectF(54, 26, self.width() - 54 - 14, self.height() - 26 - 24)
+        if n == 0 or area.width() <= 0 or area.height() <= 0:
+            return
+        maks = max(self._data.max(), 1.0)
+        lebar = area.width() / n
+
+        for a, b, kode in self._pita:
+            warna = QColor(kode)
+            warna.setAlpha(55)
+            x0 = area.left() + a * lebar
+            p.fillRect(QRectF(x0, area.top(), (b + 1 - a) * lebar, area.height()), warna)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(INK))
+        for i, nilai in enumerate(self._data):
+            if nilai > 0:
+                t = area.height() * nilai / maks
+                p.drawRect(QRectF(
+                    area.left() + i * lebar, area.bottom() - t, max(lebar, 1.0), t
+                ))
+
+        huruf = p.font()
+        huruf.setPointSize(8)
+        p.setFont(huruf)
+        for nilai, teks in self._garis:
+            x = area.left() + nilai * lebar
+            p.setPen(QPen(QColor("#C0392B"), 1, Qt.DashLine))
+            p.drawLine(int(x), int(area.top()), int(x), int(area.bottom()))
+            p.setPen(QColor("#C0392B"))
+            p.drawText(int(x) + 3, int(area.top()) + 11, teks)
+
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QColor(GARIS))
+        p.drawRect(area)
+        p.setPen(QColor(INK))
+        huruf.setBold(True)
+        p.setFont(huruf)
+        p.drawText(int(area.left()), 15, self._judul)
+        huruf.setBold(False)
+        p.setFont(huruf)
+        p.setPen(QColor(MUTED))
+        p.drawText(QRectF(0, area.top() - 2, area.left() - 6, 14),
+                   Qt.AlignRight | Qt.AlignTop, angka(maks, 0))
+        p.drawText(QRectF(0, area.bottom() - 12, area.left() - 6, 14),
+                   Qt.AlignRight | Qt.AlignBottom, "0")
+        p.drawText(int(area.left()), int(self.height()) - 8, "0")
+        p.drawText(int(area.right()) - 24, int(self.height()) - 8, str(n - 1))
+
+
+class DialogDetail(QDialog):
+    """Detail citra: tab sebelum, tab sesudah, dan tab histogram."""
+
+    def __init__(self, parent, nama_berkas, teks_sebelum, teks_sesudah,
+                 histogram=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Detail citra: {nama_berkas}")
+        self.resize(800, 680)
+        self._nama_berkas = nama_berkas
+        self._teks_semua = f"{teks_sebelum}\n\n\n{teks_sesudah}\n"
+
+        tata = QVBoxLayout(self)
+        tata.setContentsMargins(20, 14, 20, 18)
+        tata.setSpacing(12)
+
+        huruf = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        huruf.setPointSize(10)
+
+        tab = QTabWidget()
+        for judul, teks in (
+            ("Sebelum analisis", teks_sebelum),
+            ("Sesudah analisis", teks_sesudah),
+        ):
+            editor = QPlainTextEdit(teks)
+            editor.setObjectName("detail")
+            editor.setReadOnly(True)
+            editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+            editor.setFont(huruf)
+            tab.addTab(editor, judul)
+        if histogram:
+            tab.addTab(self._buat_tab_histogram(histogram), "Histogram")
+        tata.addWidget(tab, 1)
+
+        self.label_info = label("", "keterangan")
+        baris = QHBoxLayout()
+        baris.addWidget(self.label_info, 1)
+        baris.addWidget(tombol("Salin semua", "sekunder", self.salin))
+        baris.addSpacing(8)
+        baris.addWidget(tombol("Simpan .txt", "utama", self.simpan))
+        tata.addLayout(baris)
+
+    @staticmethod
+    def _buat_tab_histogram(hist):
+        halaman = QWidget()
+        tata = QVBoxLayout(halaman)
+        tata.setContentsMargins(0, 10, 0, 0)
+        tata.setSpacing(8)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Hue (H) pada objek", hist["H"],
+            pita=[(35, 85, WARNA_DATA["Hijau"]),
+                  (18, 34, WARNA_DATA["Kuning"]),
+                  (2, 17, WARNA_DATA["Cokelat"])],
+            garis=[(90, "H = 90")],
+        ), 1)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Saturation (S) pada objek", hist["S"],
+            garis=[(35, "S = 35")],
+        ), 1)
+        tata.addWidget(GrafikHistogram(
+            "Histogram Value (V) pada objek", hist["V"],
+            pita=[(0, AMBANG_GELAP, WARNA_DATA["Hitam"])],
+            garis=[(30, "V = 30"), (AMBANG_GELAP, "V = 55")],
+        ), 1)
+        return halaman
+
+    def salin(self):
+        QApplication.clipboard().setText(self._teks_semua)
+        self.label_info.setText("Teks disalin ke papan klip.")
+
+    def simpan(self):
+        nama, _ = QFileDialog.getSaveFileName(
+            self, "Simpan detail citra",
+            f"detail_{os.path.splitext(self._nama_berkas)[0]}.txt",
+            "Teks (*.txt)",
         )
+        if not nama:
+            return
+        try:
+            with open(nama, "w", encoding="utf-8") as f:
+                f.write(self._teks_semua)
+            self.label_info.setText(f"Disimpan: {os.path.basename(nama)}")
+        except OSError as e:
+            QMessageBox.warning(self, "Berkas tidak bisa disimpan", str(e))
 
-        # Menyesuaikan gambar dengan panel
-        foto_asli = Image.fromarray(asli_rgb)
-        foto_asli.thumbnail((520, 340))
 
-        gambar_asli_tk = ImageTk.PhotoImage(foto_asli)
+# ==========================================================
+# 5. JENDELA UTAMA
+# ==========================================================
 
-        area_asli.configure(
-            image=gambar_asli_tk,
-            text="",
-            width=0,
-            height=0
+class JendelaPisang(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Deteksi Kematangan Pisang")
+        self.resize(1120, 700)
+        self.setMinimumSize(960, 640)
+        self.setAcceptDrops(True)
+
+        pusat = QWidget()
+        self.setCentralWidget(pusat)
+        utama = QHBoxLayout(pusat)
+        utama.setContentsMargins(0, 0, 0, 0)
+        utama.setSpacing(0)
+
+        # Dua tampilan di area kiri: hasil (asli + segmentasi) dan tahapan proses
+        self.tumpuk = QStackedWidget()
+        self.tumpuk.addWidget(self._buat_panggung())
+        self.tumpuk.addWidget(self._buat_halaman_tahapan())
+        utama.addWidget(self.tumpuk, 1)
+        utama.addWidget(self._buat_panel())
+
+        self.statusBar().setSizeGripEnabled(False)
+        self.setStyleSheet(STYLE)
+        self.reset_hasil()
+
+    def _buat_panggung(self):
+        panggung = QFrame()
+        panggung.setObjectName("stage")
+        tata = QHBoxLayout(panggung)
+        tata.setContentsMargins(28, 28, 28, 24)
+        tata.setSpacing(24)
+
+        self.area_asli = AreaGambar(
+            "Seret foto pisang ke sini,\natau pilih Buka gambar (Ctrl+O)"
         )
+        self.area_segmentasi = AreaGambar("Hasil segmentasi tampil di sini")
 
-        # Simpan hasil untuk jendela analisis warna
-        hasil_terakhir = {
-            "segmentasi": segmentasi,
-            "persentase": persentase,
-            "dominan": dominan
+        for area, keterangan in (
+            (self.area_asli, "Asli"), (self.area_segmentasi, "Segmentasi")
+        ):
+            kolom = QVBoxLayout()
+            kolom.setSpacing(10)
+            kolom.addWidget(area, 1)
+            kolom.addWidget(label(keterangan, "caption", rata=Qt.AlignCenter))
+            tata.addLayout(kolom, 1)
+        return panggung
+
+    def _buat_halaman_tahapan(self):
+        halaman = QFrame()
+        halaman.setObjectName("stage")
+        tata = QVBoxLayout(halaman)
+        tata.setContentsMargins(28, 28, 28, 24)
+        self.panel_tahapan = PanelTahapan()
+        tata.addWidget(self.panel_tahapan)
+        return halaman
+
+    def _buat_panel(self):
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setFixedWidth(330)
+        tata = QVBoxLayout(panel)
+        tata.setContentsMargins(28, 28, 28, 24)
+        tata.setSpacing(0)
+
+        self.label_verdict = label("", "verdict", wrap=True)
+        self.label_ket = label("", "keterangan", wrap=True)
+        self.jalur = JalurWarna()
+
+        tata.addWidget(self.label_verdict)
+        tata.addSpacing(8)
+        tata.addWidget(self.label_ket)
+        tata.addSpacing(32)
+        tata.addWidget(self.jalur)
+        tata.addSpacing(16)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        self.baris = {
+            warna: BarisWarna(grid, i, warna, kode)
+            for i, (warna, kode) in enumerate(
+                {**WARNA_DATA, "Lainnya": WARNA_LAINNYA}.items()
+            )
         }
+        tata.addLayout(grid)
+        tata.addStretch(1)
 
-        label_kematangan.configure(
-            text=kematangan.upper(),
-            fg=warna_kematangan[kematangan]
+        self.tombol_tahapan = tombol(
+            "Tahapan proses", "sekunder", self.ganti_tampilan, "Ctrl+T"
+        )
+        self.tombol_detail = tombol(
+            "Detail citra", "sekunder", self.buka_detail, "Ctrl+D"
+        )
+        for widget in (
+            tombol("Buka gambar", "utama", self.pilih_gambar, "Ctrl+O"),
+            self.tombol_tahapan,
+            self.tombol_detail,
+            tombol("Bersihkan", "sekunder", self.reset_hasil),
+        ):
+            tata.addWidget(widget)
+            tata.addSpacing(8)
+        return panel
+
+    # ---------- Seret dan lepas ----------
+    @staticmethod
+    def _ambil_path(mime):
+        for url in mime.urls():
+            path = url.toLocalFile()
+            if path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and self._ambil_path(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = self._ambil_path(event.mimeData())
+        if path:
+            self.proses(path)
+
+    # ---------- Aksi ----------
+    def pilih_gambar(self):
+        nama_file, _ = QFileDialog.getOpenFileName(
+            self, "Pilih gambar pisang", "",
+            "Gambar (*.jpg *.jpeg *.png *.bmp);;Semua file (*.*)",
+        )
+        if nama_file:
+            self.proses(nama_file)
+
+    def proses(self, nama_file):
+        try:
+            gambar, segmentasi, persentase, dominan, kematangan, mask, langkah = (
+                deteksi_pisang(nama_file)
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Gambar tidak bisa diproses", str(e))
+            return
+
+        self.area_asli.set_gambar(numpy_ke_pixmap(gambar))
+        self.area_segmentasi.set_gambar(numpy_ke_pixmap(segmentasi))
+
+        for warna, nilai in persentase.items():
+            self.baris[warna].isi(f"{angka(nilai, 1)}%", warna == dominan)
+        sisa = max(0.0, 100.0 - sum(persentase.values()))
+        self.baris["Lainnya"].isi(f"{angka(sisa, 1)}%")
+        self.jalur.atur(persentase)
+
+        self.label_verdict.setText(kematangan.capitalize())
+        self.label_ket.setText(
+            f"Warna dominan {dominan.lower()}, "
+            f"{angka(persentase[dominan], 1)}% dari area pisang."
         )
 
-        tombol_analisis.configure(state="normal")
+        # Tahapan proses ditampilkan di tampilan kedua
+        self.panel_tahapan.set_langkah(langkah)
+        self.tombol_tahapan.setEnabled(True)
 
-    except Exception as e:
-        messagebox.showerror(
-            "Gagal memproses gambar",
-            str(e)
+        # Kegagalan membuat detail tidak boleh membatalkan hasil utama
+        self.nama_berkas = os.path.basename(nama_file)
+        try:
+            self.info = info_citra(
+                nama_file, gambar, segmentasi, mask,
+                persentase, dominan, kematangan
+            )                                                                                                                                                                                                                                                                                                                                                   
+            
+        except Exception as e:
+            self.info = (f"Detail citra tidak bisa dibuat: {e}",) * 2 + (None,)
+        self.tombol_detail.setEnabled(True)
+        self.statusBar().showMessage(
+            f"{self.nama_berkas}  (dianalisis pada "
+            f"{gambar.shape[1]}×{gambar.shape[0]} piksel, "
+            f"{len(langkah)} tahap proses)"
         )
 
+    def ganti_tampilan(self):
+        """Beralih antara tampilan hasil dan tampilan tahapan proses."""
+        if self.tumpuk.currentIndex() == 0:
+            self.tumpuk.setCurrentIndex(1)
+            self.tombol_tahapan.setText("Kembali ke hasil")
+            self.panel_tahapan.daftar.setFocus()
+        else:
+            self._tampilan_hasil()
 
-def reset_hasil():
-    global gambar_asli_tk, gambar_segmentasi_tk, hasil_terakhir
+    def _tampilan_hasil(self):
+        self.tumpuk.setCurrentIndex(0)
+        self.tombol_tahapan.setText("Tahapan proses")
 
-    gambar_asli_tk = None
-    gambar_segmentasi_tk = None
-    hasil_terakhir = None
+    def buka_detail(self):
+        if self.info:
+            DialogDetail(self, self.nama_berkas, *self.info).exec_()
 
-    area_asli.configure(
-        image="",
-        text="Belum ada gambar",
-        width=35,
-        height=12
-    )
-
-    label_kematangan.configure(text="Belum dianalisis", fg=hijau_tua)
-    tombol_analisis.configure(state="disabled")
-
-
-# ==========================================
-# 8. TOMBOL DAN KETERANGAN
-# ==========================================
-
-panel_bawah = tk.Frame(akar, bg="#F2F5F1")
-panel_bawah.pack(fill="x", padx=20, pady=(0, 15))
-
-panel_tombol = tk.Frame(
-    panel_bawah,
-    bg="#F2F5F1"
-)
-panel_tombol.pack()
-
-tombol_pilih = tk.Button(
-    panel_tombol,
-    text="PILIH GAMBAR",
-    command=pilih_gambar,
-    font=("Arial", 11, "bold"),
-    bg="#367A4D",
-    fg="white",
-    activebackground="#204B35",
-    activeforeground="white",
-    relief="flat",
-    padx=18,
-    pady=12,
-    cursor="hand2"
-)
-tombol_pilih.pack(side="left", padx=5)
-
-tombol_analisis = tk.Button(
-    panel_tombol,
-    text="LIHAT ANALISIS WARNA",
-    command=tampilkan_analisis,
-    font=("Arial", 11, "bold"),
-    bg="#C9A100",
-    fg="white",
-    activebackground="#9C7D00",
-    activeforeground="white",
-    disabledforeground="#EFEFEF",
-    relief="flat",
-    padx=18,
-    pady=12,
-    cursor="hand2",
-    state="disabled"
-)
-tombol_analisis.pack(side="left", padx=5)
-
-tombol_reset = tk.Button(
-    panel_tombol,
-    text="RESET HASIL",
-    command=reset_hasil,
-    font=("Arial", 11, "bold"),
-    bg="#68756C",
-    fg="white",
-    activebackground="#4B554E",
-    activeforeground="white",
-    relief="flat",
-    padx=18,
-    pady=12,
-    cursor="hand2"
-)
-tombol_reset.pack(side="left", padx=5)
-
-tk.Label(
-    panel_bawah,
-    text="Pilih gambar lain untuk melakukan analisis berikutnya.",
-    font=("Arial", 9),
-    bg="#F2F5F1",
-    fg="#68756C"
-).pack(pady=(7, 0))
+    def reset_hasil(self):
+        self.area_asli.hapus()
+        self.area_segmentasi.hapus()
+        self.panel_tahapan.kosongkan()
+        self._tampilan_hasil()
+        self.tombol_tahapan.setEnabled(False)
+        self.jalur.atur()
+        for baris in self.baris.values():
+            baris.isi("")
+        self.label_verdict.setText("Belum ada gambar")
+        self.label_ket.setText(TEKS_KOSONG)
+        self.info, self.nama_berkas = None, ""
+        self.tombol_detail.setEnabled(False)
+        self.statusBar().showMessage(PESAN_AWAL)
 
 
-# ==========================================
-# 9. MENJALANKAN APLIKASI
-# ==========================================
+# ==========================================================
+# 6. MENJALANKAN APLIKASI
+# ==========================================================
 
-akar.mainloop()
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    font = QFont("Bahnschrift")
+    if hasattr(font, "setFamilies"):
+        font.setFamilies(["Bahnschrift", "Segoe UI", "Helvetica Neue", "Noto Sans"])
+    font.setPointSize(10)
+    app.setFont(font)
+
+    jendela = JendelaPisang()
+    jendela.show()
+    sys.exit(app.exec_())
