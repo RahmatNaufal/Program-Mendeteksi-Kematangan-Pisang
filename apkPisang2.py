@@ -533,6 +533,7 @@ class JendelaPisang(QMainWindow):
 # 5. MENJALANKAN APLIKASI
 # ============================import os
 import sys
+from datetime import datetime
 from string import Template
 
 import cv2
@@ -547,7 +548,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog, QMessageBox,
     QSizePolicy, QDialog, QTabWidget, QPlainTextEdit, QListWidget,
-    QListWidgetItem, QStackedWidget
+    QListWidgetItem, QStackedWidget, QLineEdit, QCheckBox
 )
 
 
@@ -684,8 +685,8 @@ def putuskan_pisang(pengenalan, alasan_bentuk):
         if peluang < AMBANG_TOLAK:
             nama = nama_kelas(pengenalan["kelas_top1"])
             return False, (
-                f"Komputer mengenali objek ini sebagai {nama} "
-                f"({angka(pengenalan['peluang_top1'] * 100, 0)}%), bukan pisang "
+                f"Komputer mengenali objek ini sebagai {nama} bukan pisang "
+                # f"({angka(pengenalan['peluang_top1'] * 100, 0)}%), bukan pisang "
                 # f"(peluang pisang hanya {angka(peluang * 100, 1)}%)."
             )
         awalan = "Model tidak yakin. "
@@ -1304,6 +1305,15 @@ QLabel#keterangan { color: $MUTED; font-size: 13px; }
 QLabel#namaWarna, QLabel#nilaiWarna { color: $INK; font-size: 13px; }
 QLabel[tebal="true"] { font-weight: 700; }
 
+QLabel#judulSimpan { color: $INK; font-size: 18px; font-weight: 700; }
+QCheckBox { color: $INK; font-size: 13px; spacing: 8px; }
+QLineEdit {
+    background: #FBFCFB; color: $INK; border: 1px solid $GARIS;
+    border-radius: 3px; padding: 7px 9px; font-size: 13px;
+    selection-background-color: #F6E39A; selection-color: $INK;
+}
+QLineEdit:focus { border-color: #4A7BD0; }
+
 QPushButton#utama, QPushButton#sekunder {
     border-radius: 4px; padding: 10px 16px; min-height: 20px;
     font-size: 13px; font-weight: 600;
@@ -1376,6 +1386,176 @@ def tombol(teks, nama, fungsi, pintasan=None):
     if pintasan:
         tb.setShortcut(pintasan)
     return tb
+
+
+# ==========================================================
+# FITUR SIMPAN HASIL
+# ==========================================================
+
+def folder_awal_simpan():
+    """Folder awal untuk dialog simpan: Pictures bila ada, jika tidak home."""
+    gambar = os.path.join(os.path.expanduser("~"), "Pictures")
+    return gambar if os.path.isdir(gambar) else os.path.expanduser("~")
+
+
+def nama_aman(teks):
+    """Bersihkan teks agar aman dipakai sebagai bagian nama berkas."""
+    aman = "".join(
+        "_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in str(teks)
+    )
+    aman = aman.strip().rstrip(".").strip()
+    return aman or "hasil"
+
+
+def hex_ke_bgr(kode):
+    kode = kode.lstrip("#")
+    r, g, b = (int(kode[i:i + 2], 16) for i in (0, 2, 4))
+    return b, g, r
+
+
+def simpan_citra(nama, bgr):
+    """
+    Menyimpan citra BGR dengan cv2.imencode lalu menulis byte-nya sendiri.
+    Cara ini aman untuk folder atau nama berkas berhuruf non-ASCII.
+    """
+    ext = os.path.splitext(nama)[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".bmp"):
+        ext = ".png"
+    berhasil, buf = cv2.imencode(ext, bgr)
+    if not berhasil:
+        raise ValueError(f"Citra tidak bisa diubah ke format {ext}.")
+    with open(nama, "wb") as f:
+        f.write(buf.tobytes())
+
+
+def laporan_hasil(data):
+    """Menyusun laporan hasil analisis sebagai teks siap disimpan."""
+    gambar = data["gambar"]
+    persentase = data["persentase"]
+    dominan = data["dominan"]
+
+    baris = [
+        "LAPORAN HASIL DETEKSI KEMATANGAN PISANG",
+        "=" * 40,
+        kv("Berkas", data["nama_berkas"]),
+        kv("Waktu analisis", datetime.now().strftime("%d-%m-%Y %H:%M:%S")),
+        kv("Dimensi citra", f"{gambar.shape[1]} x {gambar.shape[0]} piksel"),
+        kv("Klasifikasi", data["kematangan"]),
+        kv(
+            "Warna dominan",
+            f"{dominan} ({angka(persentase[dominan], 1)}% dari area pisang)",
+        ),
+        "",
+        "KOMPOSISI WARNA PADA OBJEK PISANG",
+        "-" * 33,
+    ]
+    for warna, nilai in persentase.items():
+        tanda = "  <- dominan" if warna == dominan else ""
+        baris.append(kv(warna, f"{angka(nilai, 1)}%") + tanda)
+    sisa = max(0.0, 100.0 - sum(persentase.values()))
+    baris.append(kv("Lainnya", f"{angka(sisa, 1)}%"))
+
+    langkah = data.get("langkah") or []
+    if langkah:
+        baris += ["", "", "TAHAPAN PROSES", "-" * 14]
+        for i, tahap in enumerate(langkah, 1):
+            baris += ["", f"{i}. {tahap['judul']}"]
+            baris += [f"   {k}" for k in str(tahap["ket"]).splitlines()]
+
+    info = data.get("info")
+    if info:
+        sebelum, sesudah = info[0], info[1]
+        if sebelum:
+            baris += ["", "", sebelum]
+        if sesudah:
+            baris += ["", "", sesudah]
+
+    return "\n".join(baris) + "\n"
+
+
+def buat_gambar_ringkasan(data):
+    """
+    Kartu hasil dalam satu citra: asli dan segmentasi berdampingan,
+    dilengkapi klasifikasi dan jalur komposisi warna. Dikembalikan BGR.
+    """
+    gambar, segmentasi = data["gambar"], data["segmentasi"]
+    persentase, dominan = data["persentase"], data["dominan"]
+
+    margin, jarak, kepala, kaki = 22, 18, 64, 118
+    w1, h1 = gambar.shape[1], gambar.shape[0]
+    w2, h2 = segmentasi.shape[1], segmentasi.shape[0]
+    h_gambar = max(h1, h2)
+
+    lebar = margin * 2 + w1 + jarak + w2
+    tinggi = margin + kepala + h_gambar + 26 + kaki
+    kartu = np.full((tinggi, lebar, 3), 244, np.uint8)
+
+    def tulis(teks, x, y, skala=0.5, tebal=1, warna=(28, 33, 36)):
+        cv2.putText(
+            kartu, teks, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+            skala, warna, tebal, cv2.LINE_AA,
+        )
+
+    def tengah(teks, x, y, skala=0.5, tebal=1, warna=(28, 33, 36)):
+        (lebar_teks, _), _ = cv2.getTextSize(
+            teks, cv2.FONT_HERSHEY_SIMPLEX, skala, tebal
+        )
+        tulis(teks, x - lebar_teks / 2, y, skala, tebal, warna)
+
+    redup = (95, 106, 113)
+    tulis("Deteksi Kematangan Pisang", margin, margin + 20, 0.72, 2)
+    tulis(f"Berkas: {data['nama_berkas']}", margin, margin + 44, 0.46, 1, redup)
+
+    y_gambar = margin + kepala
+    kartu[y_gambar:y_gambar + h1, margin:margin + w1] = gambar
+    x2 = margin + w1 + jarak
+    kartu[y_gambar:y_gambar + h2, x2:x2 + w2] = segmentasi
+    y_caption = y_gambar + h_gambar + 20
+    tengah("Citra asli", margin + w1 / 2, y_caption, 0.45, 1, redup)
+    tengah("Hasil segmentasi", x2 + w2 / 2, y_caption, 0.45, 1, redup)
+
+    y_kaki = y_gambar + h_gambar + 26 + 20
+    tulis(data["kematangan"].upper(), margin, y_kaki + 10, 0.78, 2)
+    tulis(
+        f"Warna dominan {dominan.lower()}, "
+        f"{angka(persentase[dominan], 1)}% dari area pisang.",
+        margin + 2, y_kaki + 36, 0.45, 1, redup,
+    )
+
+    # Jalur komposisi warna
+    urutan = list(persentase.items())
+    sisa = max(0.0, 100.0 - sum(persentase.values()))
+    urutan.append(("Lainnya", sisa))
+
+    y_bar = y_kaki + 52
+    x = margin
+    ujung = margin + (lebar - margin * 2)
+    for warna, nilai in urutan:
+        lebar_warna = int(round((lebar - margin * 2) * max(0.0, nilai) / 100.0))
+        if lebar_warna <= 0:
+            continue
+        cv2.rectangle(
+            kartu, (x, y_bar), (x + lebar_warna, y_bar + 12),
+            hex_ke_bgr(WARNA_DATA.get(warna, WARNA_LAINNYA)), cv2.FILLED,
+        )
+        x += lebar_warna
+    if x < ujung:
+        cv2.rectangle(
+            kartu, (x, y_bar), (ujung, y_bar + 12),
+            hex_ke_bgr(WARNA_LAINNYA), cv2.FILLED,
+        )
+
+    x = margin
+    for warna, nilai in urutan:
+        teks = f"{warna} {angka(nilai, 1)}%"
+        (lebar_teks, _), _ = cv2.getTextSize(
+            teks, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1
+        )
+        if x + lebar_teks > lebar - margin:
+            break
+        tulis(teks, x, y_bar + 30, 0.4, 1)
+        x += lebar_teks + 20
+    return kartu
 
 
 # ==========================================================
@@ -1713,6 +1893,168 @@ class DialogDetail(QDialog):
             QMessageBox.warning(self, "Berkas tidak bisa disimpan", str(e))
 
 
+class DialogSimpan(QDialog):
+    """
+    Fitur simpan hasil: pilih bagian yang disimpan (laporan teks, kartu
+    ringkasan, citra, tahapan proses) beserta folder dan nama berkasnya.
+    """
+
+    def __init__(self, parent, data):
+        super().__init__(parent)
+        self.setWindowTitle("Simpan hasil analisis")
+        self.setMinimumWidth(500)
+        self._data = data
+        self._folder = folder_awal_simpan()
+        self.berkas_tersimpan = []
+
+        tata = QVBoxLayout(self)
+        tata.setContentsMargins(24, 20, 24, 20)
+        tata.setSpacing(14)
+
+        tata.addWidget(label("Simpan hasil analisis", "judulSimpan"))
+        tata.addWidget(label(
+            f"Hasil untuk {data['nama_berkas']} akan disimpan sebagai berkas "
+            "baru. Pilih bagian yang ingin disimpan.", "keterangan", wrap=True,
+        ))
+
+        kisi = QGridLayout()
+        kisi.setHorizontalSpacing(10)
+        kisi.setVerticalSpacing(10)
+        kisi.setColumnStretch(1, 1)
+        kisi.addWidget(label("Nama berkas", "namaWarna"), 0, 0)
+        self.kolom_nama = QLineEdit(
+            os.path.splitext(data["nama_berkas"])[0]
+        )
+        kisi.addWidget(self.kolom_nama, 0, 1, 1, 2)
+        kisi.addWidget(label("Folder", "namaWarna"), 1, 0)
+        self.kolom_folder = QLineEdit(self._folder)
+        self.kolom_folder.setReadOnly(True)
+        kisi.addWidget(self.kolom_folder, 1, 1)
+        kisi.addWidget(tombol("Pilih folder", "sekunder", self.pilih_folder), 1, 2)
+        tata.addLayout(kisi)
+
+        tata.addWidget(label("Yang disimpan", "namaWarna"))
+        self.kotak = {}
+        for kunci, teks, aktif in (
+            ("laporan", "Laporan analisis (.txt)", True),
+            ("ringkasan", "Kartu ringkasan hasil (.png)", True),
+            ("segmentasi", "Gambar hasil segmentasi (.png)", True),
+            ("asli", "Gambar asli (.png)", False),
+            (
+                "tahapan",
+                f"Seluruh tahapan proses ({len(data['langkah'])} gambar .png)",
+                False,
+            ),
+        ):
+            kotak = QCheckBox(teks)
+            kotak.setChecked(aktif)
+            self.kotak[kunci] = kotak
+            tata.addWidget(kotak)
+
+        self.label_info = label("", "keterangan", wrap=True)
+        tata.addWidget(self.label_info)
+
+        baris = QHBoxLayout()
+        baris.addStretch(1)
+        baris.addWidget(tombol("Batal", "sekunder", self.reject))
+        baris.addSpacing(8)
+        baris.addWidget(tombol("Simpan", "utama", self.simpan))
+        tata.addLayout(baris)
+
+    def pilih_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pilih folder penyimpanan", self._folder
+        )
+        if folder:
+            self._folder = folder
+            self.kolom_folder.setText(folder)
+
+    def _daftar_berkas(self, dasar):
+        """(nama berkas, jenis) untuk setiap bagian yang dicentang."""
+        pilihan = {k for k, kotak in self.kotak.items() if kotak.isChecked()}
+        berkas = []
+        if "laporan" in pilihan:
+            berkas.append((f"{dasar}_laporan.txt", "laporan"))
+        if "ringkasan" in pilihan:
+            berkas.append((f"{dasar}_ringkasan.png", "ringkasan"))
+        if "segmentasi" in pilihan:
+            berkas.append((f"{dasar}_segmentasi.png", "segmentasi"))
+        if "asli" in pilihan:
+            berkas.append((f"{dasar}_asli.png", "asli"))
+        if "tahapan" in pilihan:
+            for i, tahap in enumerate(self._data["langkah"], 1):
+                judul = nama_aman(tahap["judul"]).replace(" ", "_")[:40]
+                berkas.append((
+                    f"{dasar}_tahap_{i:02d}_{judul}.png", ("tahap", tahap),
+                ))
+        return pilihan, berkas
+
+    def simpan(self):
+        pilihan = {k for k, kotak in self.kotak.items() if kotak.isChecked()}
+        if not pilihan:
+            QMessageBox.information(
+                self, "Belum ada pilihan",
+                "Centang minimal satu bagian yang ingin disimpan.",
+            )
+            return
+
+        folder = self.kolom_folder.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(
+                self, "Folder tidak ditemukan",
+                "Pilih folder penyimpanan yang ada terlebih dahulu.",
+            )
+            return
+
+        dasar = nama_aman(self.kolom_nama.text())
+        _, berkas = self._daftar_berkas(dasar)
+        tujuan = [
+            (os.path.join(folder, nama), jenis) for nama, jenis in berkas
+        ]
+
+        sudah_ada = [nama for nama, _ in tujuan if os.path.exists(nama)]
+        if sudah_ada:
+            jawab = QMessageBox.question(
+                self, "Berkas sudah ada",
+                f"{len(sudah_ada)} berkas dengan nama itu sudah ada di folder "
+                "tersebut. Timpa berkasnya?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if jawab != QMessageBox.Yes:
+                return
+
+        tersimpan = []
+        try:
+            for nama, jenis in tujuan:
+                if jenis == "laporan":
+                    with open(nama, "w", encoding="utf-8") as f:
+                        f.write(laporan_hasil(self._data))
+                elif jenis == "ringkasan":
+                    simpan_citra(nama, buat_gambar_ringkasan(self._data))
+                elif jenis == "segmentasi":
+                    simpan_citra(nama, self._data["segmentasi"])
+                elif jenis == "asli":
+                    simpan_citra(nama, self._data["gambar"])
+                else:
+                    simpan_citra(nama, jenis[1]["citra"])
+                tersimpan.append(nama)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(
+                self, "Gagal menyimpan",
+                f"{len(tersimpan)} berkas berhasil disimpan, lalu berhenti:\n{e}",
+            )
+            self.berkas_tersimpan = tersimpan
+            return
+
+        self.berkas_tersimpan = tersimpan
+        self.label_info.setText(f"{len(tersimpan)} berkas disimpan.")
+        QMessageBox.information(
+            self, "Hasil disimpan",
+            f"{len(tersimpan)} berkas disimpan di:\n{folder}",
+        )
+        self.accept()
+
+
 # ==========================================================
 # 5. JENDELA UTAMA
 # ==========================================================
@@ -1811,10 +2153,14 @@ class JendelaPisang(QMainWindow):
         self.tombol_detail = tombol(
             "Detail citra", "sekunder", self.buka_detail, "Ctrl+D"
         )
+        self.tombol_simpan = tombol(
+            "Simpan hasil", "sekunder", self.simpan_hasil, "Ctrl+S"
+        )
         for widget in (
             tombol("Buka gambar", "utama", self.pilih_gambar, "Ctrl+O"),
             self.tombol_tahapan,
             self.tombol_detail,
+            self.tombol_simpan,
             tombol("Bersihkan", "sekunder", self.reset_hasil),
         ):
             tata.addWidget(widget)
@@ -1889,6 +2235,22 @@ class JendelaPisang(QMainWindow):
         except Exception as e:
             self.info = (f"Detail citra tidak bisa dibuat: {e}",) * 2 + (None,)
         self.tombol_detail.setEnabled(True)
+
+        # Data lengkap untuk fitur simpan hasil
+        self.hasil = {
+            "nama_file": nama_file,
+            "nama_berkas": self.nama_berkas,
+            "gambar": gambar,
+            "segmentasi": segmentasi,
+            "persentase": persentase,
+            "dominan": dominan,
+            "kematangan": kematangan,
+            "mask": mask,
+            "langkah": langkah,
+            "info": self.info,
+        }
+        self.tombol_simpan.setEnabled(True)
+
         self.statusBar().showMessage(
             f"{self.nama_berkas}  (dianalisis pada "
             f"{gambar.shape[1]}×{gambar.shape[0]} piksel, "
@@ -1910,6 +2272,8 @@ class JendelaPisang(QMainWindow):
         self.tombol_tahapan.setEnabled(True)
         self.info, self.nama_berkas = None, ""
         self.tombol_detail.setEnabled(False)
+        self.hasil = None
+        self.tombol_simpan.setEnabled(False)
         self.statusBar().showMessage(
             f"{os.path.basename(nama_file)}  (tidak dikenali sebagai pisang)"
         )
@@ -1931,6 +2295,17 @@ class JendelaPisang(QMainWindow):
         if self.info:
             DialogDetail(self, self.nama_berkas, *self.info).exec_()
 
+    def simpan_hasil(self):
+        """Fitur simpan hasil: laporan, ringkasan, citra, dan tahapan."""
+        if not self.hasil:
+            return
+        dialog = DialogSimpan(self, self.hasil)
+        if dialog.exec_() == QDialog.Accepted and dialog.berkas_tersimpan:
+            self.statusBar().showMessage(
+                f"{len(dialog.berkas_tersimpan)} berkas hasil disimpan di "
+                f"{os.path.dirname(dialog.berkas_tersimpan[0])}"
+            )
+
     def reset_hasil(self):
         self.area_asli.hapus()
         self.area_segmentasi.hapus()
@@ -1944,6 +2319,8 @@ class JendelaPisang(QMainWindow):
         self.label_ket.setText(TEKS_KOSONG)
         self.info, self.nama_berkas = None, ""
         self.tombol_detail.setEnabled(False)
+        self.hasil = None
+        self.tombol_simpan.setEnabled(False)
         self.statusBar().showMessage(PESAN_AWAL)
 
 
@@ -1964,9 +2341,4 @@ if __name__ == "__main__":
     jendela.show()
     sys.exit(app.exec_())
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setFont(QFont("Segoe UI", 10))
-    jendela = JendelaPisang()
-    jendela.show()
-    sys.exit(app.exec_())
+# Blok di atas adalah satu-satunya titik masuk aplikasi.

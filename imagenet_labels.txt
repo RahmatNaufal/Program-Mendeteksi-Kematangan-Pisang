@@ -37,7 +37,7 @@ mud turtle
 terrapin
 box turtle
 banded gecko
-common iguana
+Komodo dragon
 American chameleon
 whiptail
 agama
@@ -46,7 +46,7 @@ alligator lizard
 Gila monster
 green lizard
 African chameleon
-Komodo dragon
+common iguana 
 African crocodile
 American alligator
 triceratops
@@ -927,7 +927,7 @@ consomme
 hot pot
 trifle
 ice cream
-ice lolly
+watermellon
 French loaf
 bagel
 pretzel
@@ -955,7 +955,7 @@ pineapple
 banana
 jackfruit
 custard apple
-pomegranate
+apple
 hay
 carbonara
 chocolate sauce
@@ -985,7 +985,7 @@ scuba diver
 rapeseed
 daisy
 yellow lady's slipper
-corn
+ear
 acorn
 hip
 buckeye
@@ -996,5 +996,5 @@ stinkhorn
 earthstar
 hen-of-the-woods
 bolete
-ear
+corn
 toilet tissue
